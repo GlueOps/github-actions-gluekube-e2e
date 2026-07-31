@@ -1,0 +1,64 @@
+name: "GlueKube: invoke AutoGlue action"
+description: >-
+  Resolve the AutoGlue org/cluster/action by name, make sure the bastion is ready,
+  trigger an action run, and poll until it succeeds or fails.
+
+inputs:
+  base-url:
+    description: "AutoGlue API base url"
+    required: true
+  api-key:
+    description: "AutoGlue API key, sent as the X-API-KEY header (this is secrets.AUTOGLUE_API_KEY, NOT AUTOGLUE_KEY)"
+    required: true
+  org-name:
+    description: "AutoGlue org name, resolved to an org id via /orgs"
+    required: true
+  cluster-name:
+    description: "Name of the cluster to look up"
+    required: true
+  action-make-target:
+    description: "make_target of the AutoGlue action to run"
+    required: false
+    default: "setup"
+  poll-interval-seconds:
+    description: "Seconds between run-status checks"
+    required: false
+    default: "30"
+  poll-timeout-seconds:
+    description: "Give up on the run after this long. Keep it under the caller job's timeout-minutes so this fails with a useful message instead of the job being killed mid-poll."
+    required: false
+    default: "2700"
+  initial-delay-seconds:
+    description: "Settle time before the first API call"
+    required: false
+    default: "300"
+  bastion-settle-seconds:
+    description: "Settle time after the bastion check, before triggering the action run"
+    required: false
+    default: "300"
+
+runs:
+  using: composite
+  steps:
+    # This runs from ${{ github.workspace }}, NOT the caller's
+    # defaults.run.working-directory — job defaults are not inherited by composite
+    # actions. The script is cwd-independent and is located via github.action_path.
+    - name: Invoke AutoGlue action
+      shell: bash
+      env:
+        # kebab-case inputs -> the script's existing env contract, unchanged.
+        # Secrets are handed over as env, never interpolated into the run: body.
+        BASE_URL: ${{ inputs.base-url }}
+        API_KEY: ${{ inputs.api-key }}
+        ORG_NAME: ${{ inputs.org-name }}
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+        # `||` guards a caller that passes a present-but-EMPTY value: `default:`
+        # only fills in for absent inputs. A scheduled caller run forwarding
+        # `${{ inputs.action_make_target }}` sends '', which would trip the
+        # script's `: "${ACTION_MAKE_TARGET:?}"` check.
+        ACTION_MAKE_TARGET: ${{ inputs.action-make-target || 'setup' }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds || '30' }}
+        POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout-seconds || '2700' }}
+        INITIAL_DELAY_SECONDS: ${{ inputs.initial-delay-seconds || '300' }}
+        BASTION_SETTLE_SECONDS: ${{ inputs.bastion-settle-seconds || '300' }}
+      run: bash "${{ github.action_path }}/invoke_autoglue.sh"

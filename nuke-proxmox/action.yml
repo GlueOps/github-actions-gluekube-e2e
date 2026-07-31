@@ -1,0 +1,85 @@
+name: "GlueKube: nuke Proxmox cluster resources"
+description: >-
+  Backstop cleanup for a failed tofu destroy: force-delete every VM tagged with
+  the cluster name and any leftover cloud-init snippets.
+
+inputs:
+  cluster-name:
+    description: "Cluster name to match. An empty value is refused by the script rather than matching everything."
+    required: true
+  provider-credentials:
+    description: "The whole provider_credentials object (JSON or HCL); the script extracts endpoint/api_token/insecure itself. Supply this OR endpoint + api-token."
+    required: false
+    default: ""
+  endpoint:
+    description: "Proxmox API endpoint (alternative to provider-credentials)"
+    required: false
+    default: ""
+  api-token:
+    description: "Proxmox API token, user@realm!id=secret (alternative to provider-credentials)"
+    required: false
+    default: ""
+  insecure:
+    description: "Skip TLS verification"
+    required: false
+    default: "false"
+  max-rounds:
+    description: "Max retry rounds"
+    required: false
+    default: "5"
+  round-delay:
+    description: "Seconds between rounds"
+    required: false
+    default: "10"
+  dry-run:
+    description: "List resources without deleting them"
+    required: false
+    default: "false"
+  verbose:
+    description: "Enable debug logging"
+    required: false
+    default: "false"
+  python-version:
+    description: "Python to set up. An empty string skips actions/setup-python and uses whatever python is already on PATH."
+    required: false
+    default: "3.12"
+
+runs:
+  using: composite
+  steps:
+    # PRECONDITION: the caller must already have network reachability to the
+    # Proxmox API (in CI that means the Tailscale exit node is up). This action
+    # deliberately does not set up Tailscale — that is job-scoped network state.
+    - name: Set up Python
+      if: ${{ inputs.python-version != '' }}
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Python dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        python -m pip install --quiet --disable-pip-version-check \
+          -r "${{ github.action_path }}/requirements.txt"
+
+    - name: Nuke Proxmox resources
+      shell: bash
+      env:
+        PROXMOX_CLUSTER_NAME: ${{ inputs.cluster-name }}
+        PROXMOX_PROVIDER_CREDENTIALS: ${{ inputs.provider-credentials }}
+        PROXMOX_ENDPOINT: ${{ inputs.endpoint }}
+        PROXMOX_API_TOKEN: ${{ inputs.api-token }}
+        PROXMOX_INSECURE: ${{ inputs.insecure }}
+        # `||` fallbacks: these become argparse ints, and `--max-rounds ''` crashes.
+        MAX_ROUNDS: ${{ inputs.max-rounds || '5' }}
+        ROUND_DELAY: ${{ inputs.round-delay || '10' }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        VERBOSE: ${{ inputs.verbose }}
+        NUKE_SCRIPT: ${{ github.action_path }}/proxmox_nuke.py
+      run: |
+        set -euo pipefail
+        args=( --max-rounds "$MAX_ROUNDS" --round-delay "$ROUND_DELAY" )
+        if [ "$DRY_RUN" = "true" ]; then args+=( --dry-run ); fi
+        if [ "$VERBOSE" = "true" ]; then args+=( --verbose ); fi
+        python "$NUKE_SCRIPT" "${args[@]}"

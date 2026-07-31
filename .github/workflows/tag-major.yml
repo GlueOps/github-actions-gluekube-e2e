@@ -1,0 +1,47 @@
+name: tag-major
+
+# release-please maintains vX.Y.Z tags but not a moving major tag. This moves v1
+# to each new release so casual callers can use @v1.
+#
+# Consuming repos should still pin a full SHA: a moving tag makes rollback a
+# retag in THIS repo, which hits every consumer at once and leaves no trace in
+# the consumer's git history.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  tag-major:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Move the major tag
+        shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # tag_name looks like v1.2.3; take the leading major component.
+          major="${TAG%%.*}"
+          if [[ ! "$major" =~ ^v[0-9]+$ ]]; then
+            echo "::error::unexpected release tag '$TAG'; cannot derive a major tag" >&2
+            exit 1
+          fi
+          echo "Moving $major -> $TAG ($GITHUB_SHA)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f "$major" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$major"

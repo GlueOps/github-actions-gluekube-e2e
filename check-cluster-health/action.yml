@@ -1,0 +1,30 @@
+name: "GlueKube: check cluster health"
+description: >-
+  SSH through the bastion to a master and assert no pod is Pending or Failed.
+  On failure, dumps nodes, all pods, a describe for each unhealthy pod, and the
+  last 50 cluster events.
+
+inputs:
+  base-url:
+    description: "AutoGlue API base url"
+    required: true
+  api-key:
+    description: "AutoGlue API key, sent as the X-API-KEY header (secrets.AUTOGLUE_API_KEY)"
+    required: true
+  org-name:
+    description: "AutoGlue org name, resolved to an org id via /orgs"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Needs curl, jq and ssh — all preinstalled on ubuntu-latest runners.
+    # Reaching the bastion may require network setup (e.g. a Tailscale exit node)
+    # that the CALLER is responsible for establishing before this step.
+    - name: Check cluster health
+      shell: bash
+      env:
+        BASE_URL: ${{ inputs.base-url }}
+        API_KEY: ${{ inputs.api-key }}
+        ORG_NAME: ${{ inputs.org-name }}
+      run: bash "${{ github.action_path }}/check_cluster_health.sh"

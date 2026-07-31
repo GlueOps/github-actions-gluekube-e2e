@@ -1,0 +1,76 @@
+name: "GlueKube: nuke AutoGlue org resources"
+description: >-
+  Backstop cleanup: delete every resource in an AutoGlue org. Intended to run
+  with if: always() so leftovers are removed even when apply or destroy failed.
+
+inputs:
+  base-url:
+    description: "AutoGlue API base url"
+    required: true
+  org-key:
+    description: "Org API key. NOTE: the repo secret is conventionally named AUTOGLUE_KEY, and this is a DIFFERENT credential from the AUTOGLUE_API_KEY used by invoke-autoglue/check-cluster-health."
+    required: true
+  org-secret:
+    description: "Org API secret (secrets.AUTOGLUE_ORG_SECRET)"
+    required: true
+  max-rounds:
+    description: "Max retry rounds"
+    required: false
+    default: "5"
+  round-delay:
+    description: "Seconds between rounds"
+    required: false
+    default: "5"
+  dry-run:
+    description: "List resources without deleting them"
+    required: false
+    default: "false"
+  verbose:
+    description: "Enable debug logging"
+    required: false
+    default: "false"
+  python-version:
+    description: "Python to set up. An empty string skips actions/setup-python and uses whatever python is already on PATH."
+    required: false
+    default: "3.12"
+
+runs:
+  using: composite
+  steps:
+    # Skippable: setup-python mutates job-wide PATH, so a caller that manages its
+    # own Python can opt out with python-version: "".
+    - name: Set up Python
+      if: ${{ inputs.python-version != '' }}
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    # Replaces the unpinned `pip install requests` that callers used to inline.
+    - name: Install Python dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        python -m pip install --quiet --disable-pip-version-check \
+          -r "${{ github.action_path }}/requirements.txt"
+
+    - name: Nuke AutoGlue org
+      shell: bash
+      env:
+        AUTOGLUE_BASE_URL: ${{ inputs.base-url }}
+        AUTOGLUE_ORG_KEY: ${{ inputs.org-key }}
+        AUTOGLUE_ORG_SECRET: ${{ inputs.org-secret }}
+        # `||` fallbacks matter here: these become argparse ints, and
+        # `--max-rounds ''` is an int('') crash, not a default.
+        MAX_ROUNDS: ${{ inputs.max-rounds || '5' }}
+        ROUND_DELAY: ${{ inputs.round-delay || '5' }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        VERBOSE: ${{ inputs.verbose }}
+        NUKE_SCRIPT: ${{ github.action_path }}/autoglue_nuke.py
+      run: |
+        set -euo pipefail
+        args=( --max-rounds "$MAX_ROUNDS" --round-delay "$ROUND_DELAY" )
+        # `if` blocks rather than `[ x ] && args+=(...)`: a trailing false test
+        # would exit 1 under `set -e`.
+        if [ "$DRY_RUN" = "true" ]; then args+=( --dry-run ); fi
+        if [ "$VERBOSE" = "true" ]; then args+=( --verbose ); fi
+        python "$NUKE_SCRIPT" "${args[@]}"

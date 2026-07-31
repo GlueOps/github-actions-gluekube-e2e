@@ -14,6 +14,18 @@ inputs:
   org-name:
     description: "AutoGlue org name, resolved to an org id via /orgs"
     required: true
+  poll-timeout-seconds:
+    description: >-
+      How long a pod may stay unhealthy before the check fails. Pods are re-polled
+      until this deadline, so one that is briefly not ready and recovers still
+      passes; only a pod that stays broken (e.g. CrashLoopBackOff) fails. Keep it
+      under the caller job's timeout-minutes.
+    required: false
+    default: "300"
+  poll-interval-seconds:
+    description: "Delay between polls"
+    required: false
+    default: "15"
 
 runs:
   using: composite
@@ -27,4 +39,8 @@ runs:
         BASE_URL: ${{ inputs.base-url }}
         API_KEY: ${{ inputs.api-key }}
         ORG_NAME: ${{ inputs.org-name }}
+        # `||` guards a caller that forwards a present-but-EMPTY value: `default:`
+        # only fills in for ABSENT inputs, and the script rejects a non-integer.
+        POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout-seconds || '300' }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds || '15' }}
       run: bash "${{ github.action_path }}/check_cluster_health.sh"

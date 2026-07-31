@@ -4,19 +4,46 @@
 #
 # The masters sit in private subnets, so this hops through the bastion: it resolves the
 # org id by name, picks a bastion and a master, reveals both servers' ssh private keys,
-# then ssh's to the master's private ip *through* the bastion and runs
-# `kubectl get pods -A` against the kubeadm admin kubeconfig.
-# Exits 0 if kubectl responds, 1 otherwise. Requires `curl`, `jq` and `ssh` on PATH.
+# then ssh's to the master's private ip *through* the bastion and evaluates pod health
+# against the kubeadm admin kubeconfig.
+#
+# Health model (see REMOTE_CHECK below):
+#   - Succeeded pods (completed Jobs) are healthy and ignored.
+#   - Any other non-Running phase (Pending/Failed/Unknown) is unhealthy.
+#   - A Running pod is unhealthy if a container is waiting (CrashLoopBackOff,
+#     ImagePullBackOff, ...) or is not ready.
+#   - Unhealthy pods are re-polled until POLL_TIMEOUT_SECONDS, so a pod that is
+#     briefly not ready and recovers still passes; only a pod that is STUCK fails.
+#
+# Exits 0 if every pod is healthy within the deadline, 1 otherwise.
+# Requires `curl`, `jq` and `ssh` on PATH.
 #
 # Required environment variables:
 #   BASE_URL   AutoGlue API base url
 #   API_KEY    AutoGlue API key   (sent as X-API-KEY header)
 #   ORG_NAME   AutoGlue org name  (resolved to org id via the /orgs endpoint)
+#
+# Optional:
+#   POLL_TIMEOUT_SECONDS   how long a pod may stay unhealthy before failing (default 300)
+#   POLL_INTERVAL_SECONDS  delay between polls (default 15)
 set -euo pipefail
 
 : "${BASE_URL:?BASE_URL is required}"
 : "${API_KEY:?API_KEY is required}"
 : "${ORG_NAME:?ORG_NAME is required}"
+
+POLL_TIMEOUT_SECONDS="${POLL_TIMEOUT_SECONDS:-300}"
+POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-15}"
+# These are interpolated into the remote script, so reject anything that is not a
+# plain integer rather than shipping it to the master.
+for var in POLL_TIMEOUT_SECONDS POLL_INTERVAL_SECONDS; do
+  case "${!var}" in
+    "" | *[!0-9]*)
+      echo "ERROR: ${var} must be a non-negative integer, got: ${!var}" >&2
+      exit 1
+      ;;
+  esac
+done
 
 # Fetch the first server with the given role. Echoes the server object.
 get_server() {
@@ -109,27 +136,40 @@ trap 'rm -f "$BASTION_KEY_FILE" "$MASTER_KEY_FILE"' EXIT
 fetch_private_key "$BASTION_KEY_ID" "$BASTION_KEY_FILE"
 fetch_private_key "$MASTER_KEY_ID" "$MASTER_KEY_FILE"
 
-echo "==> Step 4: Running kubectl on ${MASTER_HOST} via the bastion..."
+echo "==> Step 4: Checking pod health on ${MASTER_HOST} via the bastion (deadline ${POLL_TIMEOUT_SECONDS}s)..."
 SSH_OPTS=(
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o ConnectTimeout=30
+  # The remote side polls for up to POLL_TIMEOUT_SECONDS with no output between
+  # rounds; keepalives stop a NAT/firewall from dropping an idle session.
+  -o ServerAliveInterval=30
+  -o ServerAliveCountMax=10
 )
 
-# Remote check: print all pods, then fail if any pod is in a Pending or Failed phase.
-# Runs on the master under the kubeadm admin kubeconfig.
+# Remote check: classify every pod, then keep re-polling until they are all healthy
+# or the deadline passes. Runs on the master under the kubeadm admin kubeconfig.
 #
 # NOTE: this whole string is interpolated into `sudo bash -c '...'` below, so it must not
-# contain a single quote anywhere — use double quotes only.
+# contain a single quote anywhere — use double quotes only. CI enforces this.
 #
-# On any failure it dumps cluster state before exiting: nodes, all pods, a describe for
-# each pod flagged unhealthy, and the tail of the event log. Every diagnostic is `|| true`
-# so a broken apiserver still lets the rest of the dump through. The ERR trap covers the
-# kubectl calls failing outright; the Pending/Failed branch calls the dump directly, since
-# an explicit `exit` does not fire an ERR trap.
+# One line per pod is emitted by a jsonpath template, pipe-separated so that fields which
+# hold several space-joined values (container names, ready flags, waiting reasons) stay in
+# their own column. Missing keys render empty — kubectl defaults to
+# --allow-missing-template-keys=true — so pods with no containerStatuses are handled too.
+#
+# On failure it dumps cluster state before exiting: nodes, all pods, a describe plus the
+# previous container logs for each pod flagged unhealthy, and the tail of the event log.
+# Every diagnostic is `|| true` so a broken apiserver still lets the rest of the dump
+# through. The ERR trap covers the kubectl calls failing outright; the deadline branch
+# calls the dump directly, since an explicit `exit` does not fire an ERR trap.
 REMOTE_CHECK='
 set -euo pipefail
 export KUBECONFIG=/etc/kubernetes/admin.conf
+
+POD_TEMPLATE="{range .items[*]}{.metadata.namespace}/{.metadata.name}{\"|\"}{.status.phase}{\"|\"}{.status.reason}{\"|\"}{.status.containerStatuses[*].name}{\"|\"}{.status.containerStatuses[*].ready}{\"|\"}{.status.containerStatuses[*].state.waiting.reason}{\"|\"}{.status.initContainerStatuses[*].state.waiting.reason}{\"|\"}{.status.containerStatuses[*].restartCount}{\"\n\"}{end}"
+
+bad=""
 
 dump_diagnostics() {
   echo ""
@@ -142,13 +182,15 @@ dump_diagnostics() {
   kubectl get pods -A -o wide 2>&1 || true
 
   if [ -n "${bad:-}" ]; then
-    echo "--- describe unhealthy pods ---"
-    printf "%s\n" "$bad" | while read -r ref phase; do
+    echo "--- unhealthy pod detail ---"
+    printf "%s" "$bad" | while read -r ref problems; do
       [ -n "$ref" ] || continue
       ns=${ref%%/*}
       name=${ref#*/}
-      echo "--- kubectl describe pod -n $ns $name ($phase) ---"
+      echo "--- kubectl describe pod -n $ns $name ($problems) ---"
       kubectl describe pod -n "$ns" "$name" 2>&1 || true
+      echo "--- previous container logs for $ns/$name (last 50 lines) ---"
+      kubectl logs -n "$ns" "$name" --all-containers --previous --tail=50 2>&1 || true
     done
   fi
 
@@ -159,17 +201,106 @@ dump_diagnostics() {
 }
 trap dump_diagnostics ERR
 
-kubectl get pods -A
-bad=$(kubectl get pods -A \
-  -o jsonpath="{range .items[?(@.status.phase==\"Pending\")]}{.metadata.namespace}/{.metadata.name} Pending{\"\n\"}{end}{range .items[?(@.status.phase==\"Failed\")]}{.metadata.namespace}/{.metadata.name} Failed{\"\n\"}{end}")
-if [ -n "$bad" ]; then
-  echo "ERROR: pods in Pending/Failed status:"
-  echo "$bad"
-  dump_diagnostics
-  exit 1
-fi
-echo "All pods are healthy (none Pending or Failed)."
+add_problem() {
+  if [ -z "$problems" ]; then problems="$1"; else problems="$problems $1"; fi
+}
+
+deadline=$(( $(date +%s) + POLL_TIMEOUT_SECONDS ))
+attempt=0
+
+while true; do
+  attempt=$(( attempt + 1 ))
+  pods=$(kubectl get pods -A -o jsonpath="$POD_TEMPLATE")
+  bad=""
+
+  # IFS is set only for read, so the body still word-splits the space-joined
+  # columns on whitespace as usual.
+  while IFS="|" read -r ref phase pod_reason names readys waitings init_waitings restarts; do
+    [ -n "$ref" ] || continue
+    problems=""
+
+    # A completed Job pod is healthy, not a failure.
+    if [ "$phase" = "Succeeded" ]; then
+      continue
+    fi
+
+    if [ "$phase" != "Running" ]; then
+      add_problem "phase=$phase"
+      if [ -n "$pod_reason" ]; then
+        add_problem "reason=$pod_reason"
+      fi
+    fi
+
+    # Catches CrashLoopBackOff, ImagePullBackOff, ErrImagePull, CreateContainerConfigError.
+    for reason in $waitings; do
+      add_problem "waiting=$reason"
+    done
+    for reason in $init_waitings; do
+      add_problem "init-waiting=$reason"
+    done
+
+    # Ready flags and restart counts line up with container names index-for-index:
+    # all three come from containerStatuses, and both fields are always present.
+    read -ra name_list <<< "$names"
+    read -ra ready_list <<< "$readys"
+    read -ra restart_list <<< "$restarts"
+
+    if [ "$phase" = "Running" ]; then
+      i=0
+      while [ "$i" -lt "${#ready_list[@]}" ]; do
+        if [ "${ready_list[$i]}" != "true" ]; then
+          add_problem "not-ready=${name_list[$i]:-container-$i}"
+        fi
+        i=$(( i + 1 ))
+      done
+    fi
+
+    if [ -n "$problems" ]; then
+      # Restart counts are context, never a failure on their own: a pod that
+      # restarted and is now ready has recovered. Named per container, because a
+      # bare space-joined list is unreadable on a multi-container pod.
+      restart_detail=""
+      i=0
+      while [ "$i" -lt "${#restart_list[@]}" ]; do
+        restart_detail="${restart_detail},${name_list[$i]:-container-$i}:${restart_list[$i]}"
+        i=$(( i + 1 ))
+      done
+      if [ -n "$restart_detail" ]; then
+        add_problem "restarts=${restart_detail#,}"
+      fi
+      bad="$bad$ref $problems
+"
+    fi
+  done <<< "$pods"
+
+  if [ -z "$bad" ]; then
+    kubectl get pods -A
+    echo "All pods are healthy on attempt $attempt (Succeeded pods ignored)."
+    exit 0
+  fi
+
+  now=$(date +%s)
+  echo "Attempt $attempt: $(printf "%s" "$bad" | wc -l) unhealthy pod(s):"
+  printf "%s" "$bad"
+
+  if [ "$now" -ge "$deadline" ]; then
+    echo ""
+    echo "ERROR: pods still unhealthy after ${POLL_TIMEOUT_SECONDS}s:"
+    printf "%s" "$bad"
+    dump_diagnostics
+    exit 1
+  fi
+
+  echo "Not fatal yet - re-checking in ${POLL_INTERVAL_SECONDS}s ($(( deadline - now ))s left before the deadline)."
+  sleep "$POLL_INTERVAL_SECONDS"
+done
 '
+
+# The poll knobs are prepended rather than baked into REMOTE_CHECK so the block above
+# stays a literal (CI greps it for single quotes). Both values are integer-validated.
+REMOTE_SCRIPT="POLL_TIMEOUT_SECONDS=${POLL_TIMEOUT_SECONDS}
+POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS}
+${REMOTE_CHECK}"
 
 # ProxyCommand tunnels through the bastion with the bastion's own key, so the master
 # key never has to be copied onto the bastion.
@@ -177,6 +308,6 @@ ssh -i "$MASTER_KEY_FILE" \
   "${SSH_OPTS[@]}" \
   -o ProxyCommand="ssh -i ${BASTION_KEY_FILE} ${SSH_OPTS[*]} -W %h:%p ${BASTION_USER}@${BASTION_IP}" \
   "${MASTER_USER}@${MASTER_IP}" \
-  "sudo bash -c '${REMOTE_CHECK}'"
+  "sudo bash -c '${REMOTE_SCRIPT}'"
 
-echo "Cluster is reachable and kubectl responded."
+echo "Cluster is reachable and every pod is healthy."

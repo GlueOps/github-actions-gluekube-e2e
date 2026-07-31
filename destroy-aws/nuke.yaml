@@ -1,0 +1,41 @@
+blocklist:
+- "0123456789" # Keep listing any accounts you want to ensure do NOT get touched. If you did this properly and are using IAM credentials that only have access to your sub account then this is less important and could be left with this default/invalid value
+
+# The test account has no IAM account alias set. aws-nuke aborts on aliasless
+# accounts as a safety guard; listing the account here (together with the
+# --no-alias-check CLI flag in destroy-aws.sh) opts it out of that check.
+bypass-alias-check-accounts:
+- "722741357097"
+
+accounts:
+  722741357097: {} # only the resource-types below are ever touched in this account
+
+# Allowlist: nuke ONLY considers the resource types this module provisions, so
+# IAM roles, SSO/Identity Center, S3, KMS, and everything else are never
+# scanned or deleted. Keep this list in sync with the module's AWS resources:
+#   - direct resources: aws_instance, aws_security_group(_rule), aws_vpc_endpoint,
+#     aws_vpc_peering_connection_accepter, aws_route
+#   - terraform-aws-modules/vpc/aws (network.tf): vpc, subnets, route tables,
+#     internet gateway, NAT gateways, EIPs
+# EC2 instances also implicitly create root EBS volumes and ENIs, which must be
+# included so the VPC can be torn down.
+resource-types:
+  includes:
+    - EC2Instance
+    - EC2Volume                     # instance root EBS volumes
+    - EC2NetworkInterface           # instance ENIs (block VPC/subnet deletion if left)
+    - EC2SecurityGroup              # aws_security_group (+ _rule)
+    - EC2VPCEndpoint                # aws_vpc_endpoint (s3)
+    - EC2VPCPeeringConnection       # aws_vpc_peering_connection_accepter
+    - EC2VPC
+    - EC2Subnet
+    - EC2RouteTable                 # covers aws_route / route table associations
+    - EC2InternetGateway
+    - EC2InternetGatewayAttachment
+    - EC2NATGateway
+    - EC2Address                    # NAT gateway EIPs
+
+regions: #this regions list was last updated on April 2, 2022.
+- global
+- us-west-2
+- us-east-1

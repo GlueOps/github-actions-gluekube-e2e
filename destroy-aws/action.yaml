@@ -1,0 +1,78 @@
+name: "GlueKube: nuke AWS account resources"
+description: >-
+  Backstop cleanup for a failed tofu destroy: run aws-nuke against the test
+  account using the allowlisted resource-types in nuke.yaml. Intended to run
+  with if: always() so leftovers are removed even when apply or destroy failed.
+
+inputs:
+  aws-access-key-id:
+    description: >-
+      AWS access key id. Leave empty to use credentials the job already has
+      (OIDC role, aws-actions/configure-aws-credentials, job-level env) — this
+      action never clears inherited AWS_* variables.
+    required: false
+    default: ""
+  aws-secret-access-key:
+    description: "AWS secret access key. Required if aws-access-key-id is set."
+    required: false
+    default: ""
+  aws-region:
+    description: "Region used for the initial STS/whoami call. The regions actually nuked come from nuke.yaml, not from this."
+    required: false
+    default: "us-east-1"
+  config:
+    description: >-
+      Path to an aws-nuke config. Defaults to this action's own nuke.yaml, which
+      pins the account id, the blocklist and the resource-type allowlist. Override
+      only to target a different account.
+    required: false
+    default: ""
+  aws-nuke-version:
+    description: "ekristen/aws-nuke release tag to download"
+    required: false
+    default: "v3.61.0"
+  max-wait-retries:
+    description: "How many times aws-nuke retries resources that are still in use (e.g. ENIs pinned by a NAT gateway)"
+    required: false
+    default: "200"
+  dry-run:
+    description: "List resources without deleting them. 'false' (the default) deletes."
+    required: false
+    default: "false"
+  no-alias-check:
+    description: >-
+      Skip the 'account has no IAM alias' safety guard. The account must ALSO be
+      listed under bypass-alias-check-accounts in the config — the flag alone is
+      not enough.
+    required: false
+    default: "true"
+  log-level:
+    description: "aws-nuke --log-level (e.g. debug). Empty keeps the tool's default."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Needs curl and tar — both preinstalled on ubuntu-latest runners. There is
+    # no setup-python step here (unlike the other nuke-* actions): aws-nuke is a
+    # static binary, so nothing job-wide is mutated.
+    - name: Nuke AWS account resources
+      shell: bash
+      env:
+        # Prefixed names on purpose: writing AWS_ACCESS_KEY_ID here would
+        # overwrite a caller's inherited credentials with '' whenever the input
+        # is unset. The script exports the real AWS_* names only when non-empty.
+        INPUT_AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
+        INPUT_AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
+        INPUT_AWS_REGION: ${{ inputs.aws-region }}
+        # `||` fallbacks guard a caller that forwards a present-but-EMPTY value:
+        # `default:` only fills in for ABSENT inputs, and `--max-wait-retries ''`
+        # is a parse error rather than a default.
+        NUKE_CONFIG: ${{ inputs.config || format('{0}/nuke.yaml', github.action_path) }}
+        AWS_NUKE_VERSION: ${{ inputs.aws-nuke-version || 'v3.61.0' }}
+        MAX_WAIT_RETRIES: ${{ inputs.max-wait-retries || '200' }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        NO_ALIAS_CHECK: ${{ inputs.no-alias-check }}
+        LOG_LEVEL: ${{ inputs.log-level }}
+      run: bash "${{ github.action_path }}/destroy-aws.sh"

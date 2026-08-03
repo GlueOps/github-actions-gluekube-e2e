@@ -83,9 +83,19 @@ class ProxmoxClient:
         self.session = requests.Session()
         # api_token is the full "user@realm!tokenid=secret" string from
         # provider_credentials.api_token; Proxmox expects it after "PVEAPIToken=".
+        #
+        # Deliberately NO Content-Type here. The "/api2/json" in the URL is the
+        # RESPONSE format; PVE takes request parameters form-encoded or in the query
+        # string, never as a JSON body. Declaring application/json globally made PVE
+        # try to JSON-decode the body of every POST — and status/stop sends no body,
+        # so it decoded "" and returned:
+        #   500 malformed JSON string, neither tag, array, object, number, string or
+        #   atom, at character offset 0 (before "(end of string)")
+        # which left running VMs un-stoppable and burned every nuke round. GET and
+        # DELETE were unaffected because their parameters ride in the query string,
+        # which is why snippet deletion worked while the VM stop did not.
         self.session.headers.update({
             "Authorization": f"PVEAPIToken={api_token}",
-            "Content-Type": "application/json",
         })
         self.session.verify = not insecure
         if insecure:

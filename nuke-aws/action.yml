@@ -28,9 +28,19 @@ inputs:
     required: false
     default: ""
   aws-nuke-version:
-    description: "ekristen/aws-nuke release tag to download"
+    description: >-
+      ekristen/aws-nuke release tag to download. The default version's sha256 is
+      pinned inside destroy-aws.sh; overriding this without also setting
+      aws-nuke-sha256 falls back to verifying against the release's own
+      checksums.txt, which is weaker (same origin as the binary).
     required: false
     default: "v3.61.0"
+  aws-nuke-sha256:
+    description: >-
+      Expected sha256 of the aws-nuke tarball, for versions other than the pinned
+      default. A mismatch is fatal. Get it from the release's checksums.txt.
+    required: false
+    default: ""
   max-wait-retries:
     description: "How many times aws-nuke retries resources that are still in use (e.g. ENIs pinned by a NAT gateway)"
     required: false
@@ -71,6 +81,7 @@ runs:
         # is a parse error rather than a default.
         NUKE_CONFIG: ${{ inputs.config || format('{0}/nuke.yaml', github.action_path) }}
         AWS_NUKE_VERSION: ${{ inputs.aws-nuke-version || 'v3.61.0' }}
+        AWS_NUKE_SHA256: ${{ inputs.aws-nuke-sha256 }}
         MAX_WAIT_RETRIES: ${{ inputs.max-wait-retries || '200' }}
         DRY_RUN: ${{ inputs.dry-run }}
         NO_ALIAS_CHECK: ${{ inputs.no-alias-check }}

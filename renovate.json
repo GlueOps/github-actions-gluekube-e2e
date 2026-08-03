@@ -1,0 +1,18 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "packageRules": [
+    {
+      "description": "The composite actions pin actions/setup-python to a full SHA. Renovate rewrites both the SHA and the trailing '# vX.Y.Z' comment so the pin stays current. Consumers pin THIS repo by tag, so cut a release after merging.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "pinDigests": true
+    }
+  ]
+}

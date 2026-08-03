@@ -1,3 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# Python bytecode (the nuke/health scripts are Python; these are build artifacts)
+__pycache__/
+*.pyc

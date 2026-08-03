@@ -2,21 +2,18 @@
 #
 # Check that the cluster created by `tofu apply` + the AutoGlue setup action is healthy.
 #
-# The masters sit in private subnets, so this hops through the bastion: it resolves the
-# org id by name, picks a bastion and a master, reveals both servers' ssh private keys,
-# then ssh's to the master's private ip *through* the bastion and evaluates pod health
-# against the kubeadm admin kubeconfig.
+# This script is only the *transport*. It resolves the org, picks a bastion and a
+# master, reveals both servers' ssh private keys, then hops through the bastion and
+# runs cluster_health.py on the master under the kubeadm admin kubeconfig. Every
+# assertion lives in that Python file -- see its docstring for the health model.
 #
-# Health model (see REMOTE_CHECK below):
-#   - Succeeded pods (completed Jobs) are healthy and ignored.
-#   - Any other non-Running phase (Pending/Failed/Unknown) is unhealthy.
-#   - A Running pod is unhealthy if a container is waiting (CrashLoopBackOff,
-#     ImagePullBackOff, ...) or is not ready.
-#   - Unhealthy pods are re-polled until POLL_TIMEOUT_SECONDS, so a pod that is
-#     briefly not ready and recovers still passes; only a pod that is STUCK fails.
+# The script is piped to `sudo python3 -` rather than interpolated into a shell
+# string. The previous version embedded the whole check inside `sudo bash -c '...'`,
+# which meant the check could not contain a single quote anywhere and any escaping
+# mistake became a confusing remote failure.
 #
-# Exits 0 if every pod is healthy within the deadline, 1 otherwise.
-# Requires `curl`, `jq` and `ssh` on PATH.
+# Exits 0 if every assertion holds within the deadline, 1 otherwise.
+# Requires `curl`, `jq` and `ssh` locally, and `python3` on the master.
 #
 # Required environment variables:
 #   BASE_URL   AutoGlue API base url
@@ -24,19 +21,42 @@
 #   ORG_NAME   AutoGlue org name  (resolved to org id via the /orgs endpoint)
 #
 # Optional:
-#   POLL_TIMEOUT_SECONDS   how long a pod may stay unhealthy before failing (default 300)
-#   POLL_INTERVAL_SECONDS  delay between polls (default 15)
+#   CLUSTER_NAME          restrict server lookup to this cluster (see "Isolation")
+#   HEALTH_TIMEOUT        overall deadline in seconds        (default 900)
+#   HEALTH_POLL_INTERVAL  seconds between polls              (default 15)
+#   MIN_NODE_COUNT        floor on Ready nodes, optional     (unset = no floor)
+#   MAX_RESTART_COUNT     per-container restart ceiling      (default 3)
+#
+# Isolation -- the worst bug this checker can have
+#   The failure mode that matters is a false PASS, not a false failure. If teardown
+#   failed on a previous run and its cluster is still up, an unfiltered server lookup
+#   can SSH into that healthy old cluster, pass every assertion, and report green for
+#   a cluster nobody tested. A test that can validate the wrong cluster is worse than
+#   no test, because it is trusted.
+#
+#   Two defences, in order of importance:
+#     1. Each test line has its own dedicated AutoGlue org, and the workflow runs the
+#        org nuke as a PRE-FLIGHT as well as at teardown. That makes the clean slate
+#        unconditional instead of depending on the previous run exiting cleanly.
+#        This is the primary guarantee.
+#     2. CLUSTER_NAME, below, filters the server lookup to this run's cluster as a
+#        second line of defence if the pre-flight nuke ever fails.
 set -euo pipefail
 
 : "${BASE_URL:?BASE_URL is required}"
 : "${API_KEY:?API_KEY is required}"
 : "${ORG_NAME:?ORG_NAME is required}"
 
-POLL_TIMEOUT_SECONDS="${POLL_TIMEOUT_SECONDS:-300}"
-POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-15}"
-# These are interpolated into the remote script, so reject anything that is not a
-# plain integer rather than shipping it to the master.
-for var in POLL_TIMEOUT_SECONDS POLL_INTERVAL_SECONDS; do
+CLUSTER_NAME="${CLUSTER_NAME:-}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
+HEALTH_POLL_INTERVAL="${HEALTH_POLL_INTERVAL:-15}"
+MAX_RESTART_COUNT="${MAX_RESTART_COUNT:-3}"
+MIN_NODE_COUNT="${MIN_NODE_COUNT:-}"
+
+# These are passed to the remote interpreter's environment, so reject anything that
+# is not a plain integer rather than shipping it to the master. MIN_NODE_COUNT is
+# allowed to be empty, which means "no floor".
+for var in HEALTH_TIMEOUT HEALTH_POLL_INTERVAL MAX_RESTART_COUNT; do
   case "${!var}" in
     "" | *[!0-9]*)
       echo "ERROR: ${var} must be a non-negative integer, got: ${!var}" >&2
@@ -44,19 +64,103 @@ for var in POLL_TIMEOUT_SECONDS POLL_INTERVAL_SECONDS; do
       ;;
   esac
 done
+case "$MIN_NODE_COUNT" in
+  "") ;;
+  *[!0-9]*)
+    echo "ERROR: MIN_NODE_COUNT must be a non-negative integer or empty, got: ${MIN_NODE_COUNT}" >&2
+    exit 1
+    ;;
+esac
 
-# Fetch the first server with the given role. Echoes the server object.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REMOTE_SCRIPT="${SCRIPT_DIR}/cluster_health.py"
+if [ ! -f "$REMOTE_SCRIPT" ]; then
+  echo "ERROR: cluster_health.py not found next to this script (${REMOTE_SCRIPT})" >&2
+  exit 1
+fi
+
+echo "==> Step 1: Getting org_id for org '${ORG_NAME}'..."
+ORGS=$(curl -sfS --http1.1 -X GET "${BASE_URL}/orgs" \
+  -H "accept: application/json" \
+  -H "X-API-KEY: ${API_KEY}")
+
+ORG_ID=$(echo "$ORGS" | jq -r --arg name "$ORG_NAME" \
+  '.[] | select(.name == $name) | .id')
+
+if [ -z "$ORG_ID" ] || [ "$ORG_ID" = "null" ]; then
+  echo "ERROR: Org '${ORG_NAME}' not found"
+  exit 1
+fi
+echo "Found org_id: ${ORG_ID}"
+
+# Resolve this run's cluster id when CLUSTER_NAME is supplied, so the server lookup
+# below can be filtered to it.
+CLUSTER_ID=""
+if [ -n "$CLUSTER_NAME" ]; then
+  echo "==> Step 1b: Getting cluster_id for cluster '${CLUSTER_NAME}'..."
+  CLUSTERS=$(curl -sfS --http1.1 -G "${BASE_URL}/clusters" \
+    --data-urlencode "q=${CLUSTER_NAME}" \
+    -H "accept: application/json" \
+    -H "X-API-KEY: ${API_KEY}" \
+    -H "x-org-id: ${ORG_ID}")
+
+  CLUSTER_ID=$(echo "$CLUSTERS" | jq -r --arg n "$CLUSTER_NAME" \
+    'map(select(.name == $n)) | .[0].id // empty')
+  if [ -z "$CLUSTER_ID" ]; then
+    echo "ERROR: cluster '${CLUSTER_NAME}' not found in org '${ORG_NAME}'." >&2
+    echo "The apply step should have created it. Refusing to fall back to an" >&2
+    echo "unfiltered server lookup, which could select a previous run's cluster." >&2
+    exit 1
+  fi
+  echo "Found cluster_id: ${CLUSTER_ID}"
+else
+  echo "WARNING: CLUSTER_NAME is not set, so servers cannot be filtered to this run's"
+  echo "WARNING: cluster. The pre-flight org nuke is then the ONLY thing standing"
+  echo "WARNING: between this check and a leftover cluster from a previous run."
+fi
+
+# Fetch a server with the given role, restricted to this run's cluster when we know
+# its id. Echoes the server object.
 get_server() {
   local role="$1"
-  local servers
+  local servers count filtered
   servers=$(curl -sfS --http1.1 -G "${BASE_URL}/servers" \
     --data-urlencode "role=${role}" \
     -H "accept: application/json" \
     -H "X-API-KEY: ${API_KEY}" \
     -H "x-org-id: ${ORG_ID}")
 
+  count=$(echo "$servers" | jq -r 'length')
+  filtered="$servers"
+
+  if [ -n "$CLUSTER_ID" ]; then
+    # Only filter when the records actually carry a cluster id. If the API does not
+    # expose one on /servers, say so loudly rather than silently filtering to
+    # nothing (which would look like "no servers" and mask the real situation).
+    if [ "$(echo "$servers" | jq -r '[.[] | select(has("cluster_id"))] | length')" -gt 0 ]; then
+      filtered=$(echo "$servers" | jq --arg cid "$CLUSTER_ID" 'map(select(.cluster_id == $cid))')
+      local kept
+      kept=$(echo "$filtered" | jq -r 'length')
+      echo "  ${role}: ${count} in org, ${kept} in cluster ${CLUSTER_ID}" >&2
+    else
+      echo "  WARNING: /servers records carry no cluster_id, so the ${role} lookup" >&2
+      echo "  WARNING: cannot be filtered to this run's cluster. Relying on the" >&2
+      echo "  WARNING: pre-flight org nuke for isolation." >&2
+    fi
+  fi
+
+  # More than one bastion in a dedicated, pre-nuked org means leftovers survived.
+  # Warn rather than fail: several masters is normal, and the operator needs to see
+  # the count either way.
+  local n
+  n=$(echo "$filtered" | jq -r 'length')
+  if [ "$role" = "bastion" ] && [ "$n" -gt 1 ]; then
+    echo "  WARNING: ${n} bastion servers matched. In a dedicated org that should be 1;" >&2
+    echo "  WARNING: leftovers from a previous run may still exist." >&2
+  fi
+
   local server
-  server=$(echo "$servers" | jq -r '.[0] // empty')
+  server=$(echo "$filtered" | jq -r '.[0] // empty')
   if [ -z "$server" ]; then
     echo "ERROR: no ${role} servers returned by ${BASE_URL}/servers?role=${role}" >&2
     return 1
@@ -85,20 +189,6 @@ fetch_private_key() {
   [ -n "$(tail -c1 "$out_file")" ] && echo >> "$out_file"
   return 0
 }
-
-echo "==> Step 1: Getting org_id for org '${ORG_NAME}'..."
-ORGS=$(curl -sfS --http1.1 -X GET "${BASE_URL}/orgs" \
-  -H "accept: application/json" \
-  -H "X-API-KEY: ${API_KEY}")
-
-ORG_ID=$(echo "$ORGS" | jq -r --arg name "$ORG_NAME" \
-  '.[] | select(.name == $name) | .id')
-
-if [ -z "$ORG_ID" ] || [ "$ORG_ID" = "null" ]; then
-  echo "ERROR: Org '${ORG_NAME}' not found"
-  exit 1
-fi
-echo "Found org_id: ${ORG_ID}"
 
 echo "==> Step 2: Getting the bastion and a master server..."
 BASTION=$(get_server bastion)
@@ -136,178 +226,43 @@ trap 'rm -f "$BASTION_KEY_FILE" "$MASTER_KEY_FILE"' EXIT
 fetch_private_key "$BASTION_KEY_ID" "$BASTION_KEY_FILE"
 fetch_private_key "$MASTER_KEY_ID" "$MASTER_KEY_FILE"
 
-echo "==> Step 4: Checking pod health on ${MASTER_HOST} via the bastion (deadline ${POLL_TIMEOUT_SECONDS}s)..."
 SSH_OPTS=(
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o ConnectTimeout=30
-  # The remote side polls for up to POLL_TIMEOUT_SECONDS with no output between
-  # rounds; keepalives stop a NAT/firewall from dropping an idle session.
+  # The remote side polls for up to HEALTH_TIMEOUT with no output between rounds;
+  # keepalives stop a NAT/firewall from dropping an idle session.
   -o ServerAliveInterval=30
   -o ServerAliveCountMax=10
 )
-
-# Remote check: classify every pod, then keep re-polling until they are all healthy
-# or the deadline passes. Runs on the master under the kubeadm admin kubeconfig.
-#
-# NOTE: this whole string is interpolated into `sudo bash -c '...'` below, so it must not
-# contain a single quote anywhere — use double quotes only. CI enforces this.
-#
-# One line per pod is emitted by a jsonpath template, pipe-separated so that fields which
-# hold several space-joined values (container names, ready flags, waiting reasons) stay in
-# their own column. Missing keys render empty — kubectl defaults to
-# --allow-missing-template-keys=true — so pods with no containerStatuses are handled too.
-#
-# On failure it dumps cluster state before exiting: nodes, all pods, a describe plus the
-# previous container logs for each pod flagged unhealthy, and the tail of the event log.
-# Every diagnostic is `|| true` so a broken apiserver still lets the rest of the dump
-# through. The ERR trap covers the kubectl calls failing outright; the deadline branch
-# calls the dump directly, since an explicit `exit` does not fire an ERR trap.
-REMOTE_CHECK='
-set -euo pipefail
-export KUBECONFIG=/etc/kubernetes/admin.conf
-
-POD_TEMPLATE="{range .items[*]}{.metadata.namespace}/{.metadata.name}{\"|\"}{.status.phase}{\"|\"}{.status.reason}{\"|\"}{.status.containerStatuses[*].name}{\"|\"}{.status.containerStatuses[*].ready}{\"|\"}{.status.containerStatuses[*].state.waiting.reason}{\"|\"}{.status.initContainerStatuses[*].state.waiting.reason}{\"|\"}{.status.containerStatuses[*].restartCount}{\"\n\"}{end}"
-
-bad=""
-
-dump_diagnostics() {
-  echo ""
-  echo "================== FAILURE DIAGNOSTICS =================="
-
-  echo "--- kubectl get nodes -o wide ---"
-  kubectl get nodes -o wide 2>&1 || true
-
-  echo "--- kubectl get pods -A -o wide ---"
-  kubectl get pods -A -o wide 2>&1 || true
-
-  if [ -n "${bad:-}" ]; then
-    echo "--- unhealthy pod detail ---"
-    printf "%s" "$bad" | while read -r ref problems; do
-      [ -n "$ref" ] || continue
-      ns=${ref%%/*}
-      name=${ref#*/}
-      echo "--- kubectl describe pod -n $ns $name ($problems) ---"
-      kubectl describe pod -n "$ns" "$name" 2>&1 || true
-      echo "--- previous container logs for $ns/$name (last 50 lines) ---"
-      kubectl logs -n "$ns" "$name" --all-containers --previous --tail=50 2>&1 || true
-    done
-  fi
-
-  echo "--- kubectl get events -A --sort-by=.lastTimestamp (last 50) ---"
-  kubectl get events -A --sort-by=.lastTimestamp 2>&1 | tail -n 50 || true
-
-  echo "========================================================"
-}
-trap dump_diagnostics ERR
-
-add_problem() {
-  if [ -z "$problems" ]; then problems="$1"; else problems="$problems $1"; fi
-}
-
-deadline=$(( $(date +%s) + POLL_TIMEOUT_SECONDS ))
-attempt=0
-
-while true; do
-  attempt=$(( attempt + 1 ))
-  pods=$(kubectl get pods -A -o jsonpath="$POD_TEMPLATE")
-  bad=""
-
-  # IFS is set only for read, so the body still word-splits the space-joined
-  # columns on whitespace as usual.
-  while IFS="|" read -r ref phase pod_reason names readys waitings init_waitings restarts; do
-    [ -n "$ref" ] || continue
-    problems=""
-
-    # A completed Job pod is healthy, not a failure.
-    if [ "$phase" = "Succeeded" ]; then
-      continue
-    fi
-
-    if [ "$phase" != "Running" ]; then
-      add_problem "phase=$phase"
-      if [ -n "$pod_reason" ]; then
-        add_problem "reason=$pod_reason"
-      fi
-    fi
-
-    # Catches CrashLoopBackOff, ImagePullBackOff, ErrImagePull, CreateContainerConfigError.
-    for reason in $waitings; do
-      add_problem "waiting=$reason"
-    done
-    for reason in $init_waitings; do
-      add_problem "init-waiting=$reason"
-    done
-
-    # Ready flags and restart counts line up with container names index-for-index:
-    # all three come from containerStatuses, and both fields are always present.
-    read -ra name_list <<< "$names"
-    read -ra ready_list <<< "$readys"
-    read -ra restart_list <<< "$restarts"
-
-    if [ "$phase" = "Running" ]; then
-      i=0
-      while [ "$i" -lt "${#ready_list[@]}" ]; do
-        if [ "${ready_list[$i]}" != "true" ]; then
-          add_problem "not-ready=${name_list[$i]:-container-$i}"
-        fi
-        i=$(( i + 1 ))
-      done
-    fi
-
-    if [ -n "$problems" ]; then
-      # Restart counts are context, never a failure on their own: a pod that
-      # restarted and is now ready has recovered. Named per container, because a
-      # bare space-joined list is unreadable on a multi-container pod.
-      restart_detail=""
-      i=0
-      while [ "$i" -lt "${#restart_list[@]}" ]; do
-        restart_detail="${restart_detail},${name_list[$i]:-container-$i}:${restart_list[$i]}"
-        i=$(( i + 1 ))
-      done
-      if [ -n "$restart_detail" ]; then
-        add_problem "restarts=${restart_detail#,}"
-      fi
-      bad="$bad$ref $problems
-"
-    fi
-  done <<< "$pods"
-
-  if [ -z "$bad" ]; then
-    kubectl get pods -A
-    echo "All pods are healthy on attempt $attempt (Succeeded pods ignored)."
-    exit 0
-  fi
-
-  now=$(date +%s)
-  echo "Attempt $attempt: $(printf "%s" "$bad" | wc -l) unhealthy pod(s):"
-  printf "%s" "$bad"
-
-  if [ "$now" -ge "$deadline" ]; then
-    echo ""
-    echo "ERROR: pods still unhealthy after ${POLL_TIMEOUT_SECONDS}s:"
-    printf "%s" "$bad"
-    dump_diagnostics
-    exit 1
-  fi
-
-  echo "Not fatal yet - re-checking in ${POLL_INTERVAL_SECONDS}s ($(( deadline - now ))s left before the deadline)."
-  sleep "$POLL_INTERVAL_SECONDS"
-done
-'
-
-# The poll knobs are prepended rather than baked into REMOTE_CHECK so the block above
-# stays a literal (CI greps it for single quotes). Both values are integer-validated.
-REMOTE_SCRIPT="POLL_TIMEOUT_SECONDS=${POLL_TIMEOUT_SECONDS}
-POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS}
-${REMOTE_CHECK}"
-
 # ProxyCommand tunnels through the bastion with the bastion's own key, so the master
 # key never has to be copied onto the bastion.
-ssh -i "$MASTER_KEY_FILE" \
-  "${SSH_OPTS[@]}" \
-  -o ProxyCommand="ssh -i ${BASTION_KEY_FILE} ${SSH_OPTS[*]} -W %h:%p ${BASTION_USER}@${BASTION_IP}" \
-  "${MASTER_USER}@${MASTER_IP}" \
-  "sudo bash -c '${REMOTE_SCRIPT}'"
+SSH_TO_MASTER=(
+  ssh -i "$MASTER_KEY_FILE"
+  "${SSH_OPTS[@]}"
+  -o ProxyCommand="ssh -i ${BASTION_KEY_FILE} ${SSH_OPTS[*]} -W %h:%p ${BASTION_USER}@${BASTION_IP}"
+  "${MASTER_USER}@${MASTER_IP}"
+)
 
-echo "Cluster is reachable and every pod is healthy."
+echo "==> Step 4: Checking that python3 is available on ${MASTER_HOST}..."
+# Checked up front so a missing interpreter is one clear line rather than a
+# truncated traceback after the script has already been piped over.
+if ! "${SSH_TO_MASTER[@]}" "command -v python3 >/dev/null 2>&1"; then
+  echo "ERROR: python3 not found on master ${MASTER_HOST}." >&2
+  echo "The health assertions run there as a Python script. Install python3 in the" >&2
+  echo "node image, or adjust cluster_health.py's invocation below." >&2
+  exit 1
+fi
+
+echo "==> Step 5: Running cluster health assertions on ${MASTER_HOST} (deadline ${HEALTH_TIMEOUT}s)..."
+# The script arrives on stdin, so nothing is interpolated into a shell string. All
+# knobs are integer-validated above, so `env VAR=value` is safe to build by hand.
+"${SSH_TO_MASTER[@]}" \
+  "sudo env KUBECONFIG=/etc/kubernetes/admin.conf \
+     HEALTH_TIMEOUT=${HEALTH_TIMEOUT} \
+     HEALTH_POLL_INTERVAL=${HEALTH_POLL_INTERVAL} \
+     MAX_RESTART_COUNT=${MAX_RESTART_COUNT} \
+     MIN_NODE_COUNT=${MIN_NODE_COUNT} \
+     python3 -" < "$REMOTE_SCRIPT"
+
+echo "Cluster is reachable and every assertion passed."

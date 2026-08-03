@@ -28,14 +28,17 @@ inputs:
     description: "Give up on the run after this long. Keep it under the caller job's timeout-minutes so this fails with a useful message instead of the job being killed mid-poll."
     required: false
     default: "2700"
-  initial-delay-seconds:
-    description: "Settle time before the first API call"
+  bastion-ready-timeout:
+    description: >-
+      How long to wait for the bastion to report ready before giving up. This
+      replaces the two fixed 300s settle sleeps that used to cost every run ten
+      minutes regardless of how fast the bastion actually came up.
     required: false
-    default: "300"
-  bastion-settle-seconds:
-    description: "Settle time after the bastion check, before triggering the action run"
+    default: "600"
+  bastion-poll-interval:
+    description: "Seconds between bastion status checks"
     required: false
-    default: "300"
+    default: "15"
 
 runs:
   using: composite
@@ -59,6 +62,6 @@ runs:
         ACTION_MAKE_TARGET: ${{ inputs.action-make-target || 'setup' }}
         POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds || '30' }}
         POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout-seconds || '2700' }}
-        INITIAL_DELAY_SECONDS: ${{ inputs.initial-delay-seconds || '300' }}
-        BASTION_SETTLE_SECONDS: ${{ inputs.bastion-settle-seconds || '300' }}
+        BASTION_READY_TIMEOUT: ${{ inputs.bastion-ready-timeout || '600' }}
+        BASTION_POLL_INTERVAL: ${{ inputs.bastion-poll-interval || '15' }}
       run: bash "${{ github.action_path }}/invoke_autoglue.sh"

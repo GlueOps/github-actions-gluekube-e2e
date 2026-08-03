@@ -17,27 +17,27 @@
 # Optional:
 #   POLL_INTERVAL_SECONDS  seconds between status checks (default 30)
 #   POLL_TIMEOUT_SECONDS   give up on the run after this long (default 2700 = 45m)
-#   INITIAL_DELAY_SECONDS  settle time before touching the API at all (default 300)
-#   BASTION_SETTLE_SECONDS settle time after the bastion check, before triggering (default 300)
+#   BASTION_READY_TIMEOUT  how long to wait for the bastion to report ready (default 600)
+#   BASTION_POLL_INTERVAL  seconds between bastion status checks (default 15)
 set -euo pipefail
 
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
 # Kept under the workflow job's timeout-minutes so the script fails with a useful message
 # naming the last status, rather than the job being killed mid-poll with no explanation.
 POLL_TIMEOUT_SECONDS="${POLL_TIMEOUT_SECONDS:-2700}"
-# Its own knob rather than reusing POLL_INTERVAL_SECONDS: this is a settle window, not a
-# poll cadence, so dropping the poll interval must not silently shorten it.
-INITIAL_DELAY_SECONDS="${INITIAL_DELAY_SECONDS:-300}"
-BASTION_SETTLE_SECONDS="${BASTION_SETTLE_SECONDS:-300}"
+# The bastion readiness wait is a bounded POLL, not a fixed sleep. It used to be two
+# unconditional `sleep 300`s -- one before touching the API at all, one after nudging
+# the bastion -- which cost every run ten minutes whether or not anything needed the
+# time, and still gave no guarantee at the end of it. Polling both removes the dead
+# time from a fast run and actually waits for the condition on a slow one.
+BASTION_READY_TIMEOUT="${BASTION_READY_TIMEOUT:-600}"
+BASTION_POLL_INTERVAL="${BASTION_POLL_INTERVAL:-15}"
 
-# Validate before the settle sleep, so a missing variable fails immediately.
 : "${BASE_URL:?BASE_URL is required}"
 : "${API_KEY:?API_KEY is required}"
 : "${ORG_NAME:?ORG_NAME is required}"
 : "${CLUSTER_NAME:?CLUSTER_NAME is required}"
 : "${ACTION_MAKE_TARGET:?ACTION_MAKE_TARGET is required}"
-
-sleep "${INITIAL_DELAY_SECONDS}"
 
 echo "==> Step 1: Getting org_id for org '${ORG_NAME}'..."
 ORGS=$(curl -sfS --http1.1 -X GET "${BASE_URL}/orgs" \
@@ -83,38 +83,62 @@ if [ -z "$ACTION_ID" ] || [ "$ACTION_ID" = "null" ]; then
 fi
 echo "Found action_id: ${ACTION_ID}"
 
-echo "==> Step 4: Checking bastion status..."
-BASTIONS=$(curl -sfS --http1.1 -G "${BASE_URL}/servers" \
-  --data-urlencode "role=bastion" \
-  -H "accept: application/json" \
-  -H "X-API-KEY: ${API_KEY}" \
-  -H "x-org-id: ${ORG_ID}")
+echo "==> Step 4: Waiting for the bastion to report ready (deadline ${BASTION_READY_TIMEOUT}s)..."
+# Fetch the bastion record. Echoes the server object, empty if there is none yet.
+get_bastion() {
+  curl -sfS --http1.1 -G "${BASE_URL}/servers" \
+    --data-urlencode "role=bastion" \
+    -H "accept: application/json" \
+    -H "X-API-KEY: ${API_KEY}" \
+    -H "x-org-id: ${ORG_ID}" 2>/dev/null | jq -r '.[0] // empty'
+}
 
-BASTION=$(echo "$BASTIONS" | jq -r '.[0] // empty')
-if [ -z "$BASTION" ]; then
-  echo "ERROR: no bastion server returned by ${BASE_URL}/servers?role=bastion"
+SECONDS=0
+NUDGED=false
+BASTION_READY=false
+LAST_BASTION_STATUS="unknown (no successful check yet)"
+
+while [ "$SECONDS" -lt "$BASTION_READY_TIMEOUT" ]; do
+  BASTION=$(get_bastion || true)
+  if [ -z "$BASTION" ]; then
+    # Right after apply the record may not be visible yet. Transient until the
+    # deadline, rather than an immediate hard failure.
+    echo "  no bastion server yet (${SECONDS}s elapsed) - retrying in ${BASTION_POLL_INTERVAL}s"
+    sleep "$BASTION_POLL_INTERVAL"
+    continue
+  fi
+
+  BASTION_ID=$(echo "$BASTION" | jq -r '.id')
+  BASTION_STATUS=$(echo "$BASTION" | jq -r '.status' | tr '[:upper:]' '[:lower:]')
+  LAST_BASTION_STATUS="$BASTION_STATUS"
+  echo "  bastion ${BASTION_ID} status: ${BASTION_STATUS} (${SECONDS}s elapsed)"
+
+  if [ "$BASTION_STATUS" = "ready" ]; then
+    BASTION_READY=true
+    break
+  fi
+
+  # Nudge once, not every round: repeatedly PATCHing back to pending would reset
+  # progress the provisioner is making.
+  if [ "$NUDGED" = false ]; then
+    echo "  bastion is not ready, setting its status back to pending..."
+    curl -sfS --http1.1 -X PATCH "${BASE_URL}/servers/${BASTION_ID}" \
+      -H "accept: application/json" \
+      -H "content-type: application/json" \
+      -H "X-API-KEY: ${API_KEY}" \
+      -H "x-org-id: ${ORG_ID}" \
+      --data-raw '{"status":"pending"}' > /dev/null
+    NUDGED=true
+  fi
+
+  sleep "$BASTION_POLL_INTERVAL"
+done
+
+if [ "$BASTION_READY" != true ]; then
+  echo "ERROR: bastion did not report ready within ${BASTION_READY_TIMEOUT}s — last status: ${LAST_BASTION_STATUS}"
   exit 1
 fi
-
-BASTION_ID=$(echo "$BASTION" | jq -r '.id')
-BASTION_STATUS=$(echo "$BASTION" | jq -r '.status' | tr '[:upper:]' '[:lower:]')
-echo "bastion ${BASTION_ID} status: ${BASTION_STATUS}"
-
-if [ "$BASTION_STATUS" = "ready" ]; then
-  echo "Bastion is ready."
-else
-  echo "Bastion is not ready, setting its status back to pending..."
-  curl -sfS --http1.1 -X PATCH "${BASE_URL}/servers/${BASTION_ID}" \
-    -H "accept: application/json" \
-    -H "content-type: application/json" \
-    -H "X-API-KEY: ${API_KEY}" \
-    -H "x-org-id: ${ORG_ID}" \
-    --data-raw '{"status":"pending"}' > /dev/null
-fi
-
-# Settle window between nudging the bastion and triggering the action. Same 300s
-# as before; a knob only so the mock-API tests can drive it to 0.
-sleep "${BASTION_SETTLE_SECONDS}"
+echo "Bastion is ready after ${SECONDS}s."
 
 echo "==> Step 5: Triggering action run..."
 RESPONSE=$(curl -sfS --http1.1 -X POST "${BASE_URL}/clusters/${CLUSTER_ID}/actions/${ACTION_ID}/runs" \

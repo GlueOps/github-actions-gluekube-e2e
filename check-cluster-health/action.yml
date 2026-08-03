@@ -1,8 +1,11 @@
 name: "GlueKube: check cluster health"
 description: >-
-  SSH through the bastion to a master and assert no pod is Pending or Failed.
-  On failure, dumps nodes, all pods, a describe for each unhealthy pod, and the
-  last 50 cluster events.
+  SSH through the bastion to a master and assert the cluster reached its expected
+  state: nodes joined and Ready, a control-plane node present and Ready, every pod
+  healthy (containers ready, not just phase Running), and no container above the
+  restart ceiling. Polls until the assertions hold or the deadline expires. On
+  failure, dumps nodes, all pods, a describe plus previous logs for each unhealthy
+  pod, and the last 50 cluster events.
 
 inputs:
   base-url:
@@ -14,23 +17,47 @@ inputs:
   org-name:
     description: "AutoGlue org name, resolved to an org id via /orgs"
     required: true
-  poll-timeout-seconds:
+  cluster-name:
     description: >-
-      How long a pod may stay unhealthy before the check fails. Pods are re-polled
-      until this deadline, so one that is briefly not ready and recovers still
-      passes; only a pod that stays broken (e.g. CrashLoopBackOff) fails. Keep it
-      under the caller job's timeout-minutes.
+      This run's cluster name (secrets.AUTOGLUE_CLUSTER_NAME). Strongly recommended:
+      it restricts the bastion/master lookup to this run's cluster, so a leftover
+      cluster from a previous run cannot be checked instead. Without it the check
+      relies entirely on the caller's pre-flight org nuke for isolation, and the
+      failure mode is a false PASS.
     required: false
-    default: "300"
-  poll-interval-seconds:
-    description: "Delay between polls"
+    default: ""
+  health-timeout:
+    description: >-
+      Overall deadline in seconds. Assertions are re-evaluated until they all hold
+      simultaneously or this expires, so a node or pod that is briefly not ready and
+      recovers still passes; only something STUCK fails. Keep it under the caller
+      job's timeout-minutes.
+    required: false
+    default: "900"
+  health-poll-interval:
+    description: "Seconds between polls"
     required: false
     default: "15"
+  min-node-count:
+    description: >-
+      Optional floor on Ready nodes. Unset by default and deliberately so: the
+      assertions derive everything else from the cluster itself. Set it only if a
+      whole node pool failing to provision has actually bitten you — pods targeting
+      the missing pool's labels go Pending and fail the pod assertions anyway.
+    required: false
+    default: ""
+  max-restart-count:
+    description: >-
+      Per-container restart ceiling. Catches a crashloop that happens to be
+      momentarily Ready at the instant it was polled.
+    required: false
+    default: "3"
 
 runs:
   using: composite
   steps:
-    # Needs curl, jq and ssh — all preinstalled on ubuntu-latest runners.
+    # Needs curl, jq and ssh locally — all preinstalled on ubuntu-latest runners —
+    # and python3 on the master, which the script checks for up front.
     # Reaching the bastion may require network setup (e.g. a Tailscale exit node)
     # that the CALLER is responsible for establishing before this step.
     - name: Check cluster health
@@ -39,8 +66,12 @@ runs:
         BASE_URL: ${{ inputs.base-url }}
         API_KEY: ${{ inputs.api-key }}
         ORG_NAME: ${{ inputs.org-name }}
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
         # `||` guards a caller that forwards a present-but-EMPTY value: `default:`
         # only fills in for ABSENT inputs, and the script rejects a non-integer.
-        POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout-seconds || '300' }}
-        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds || '15' }}
+        HEALTH_TIMEOUT: ${{ inputs.health-timeout || '900' }}
+        HEALTH_POLL_INTERVAL: ${{ inputs.health-poll-interval || '15' }}
+        MAX_RESTART_COUNT: ${{ inputs.max-restart-count || '3' }}
+        # No `||` fallback: empty is a meaningful value here (no floor).
+        MIN_NODE_COUNT: ${{ inputs.min-node-count }}
       run: bash "${{ github.action_path }}/check_cluster_health.sh"

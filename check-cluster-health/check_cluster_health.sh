@@ -27,6 +27,14 @@
 #   MIN_NODE_COUNT        floor on Ready nodes, optional     (unset = no floor)
 #   MAX_RESTART_COUNT     per-container restart ceiling      (default 3)
 #
+# Optional, for the UPGRADE test. All three are off by default, so a plain apply
+# run behaves exactly as it did before they existed:
+#   EXPECTED_KUBELET_VERSION  e.g. v1.34.5   (unset = version assertion skipped)
+#   REQUIRE_SCHEDULABLE       1 to fail on a node left cordoned  (unset = skipped)
+#   SMOKE_TEST                1 to run cluster_smoke.py after the assertions pass
+#   SMOKE_TIMEOUT             smoke deadline in seconds         (default 300)
+#   SMOKE_POLL_INTERVAL       seconds between smoke attempts    (default 10)
+#
 # Isolation -- the worst bug this checker can have
 #   The failure mode that matters is a false PASS, not a false failure. If teardown
 #   failed on a previous run and its cluster is still up, an unfiltered server lookup
@@ -52,11 +60,16 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
 HEALTH_POLL_INTERVAL="${HEALTH_POLL_INTERVAL:-15}"
 MAX_RESTART_COUNT="${MAX_RESTART_COUNT:-3}"
 MIN_NODE_COUNT="${MIN_NODE_COUNT:-}"
+EXPECTED_KUBELET_VERSION="${EXPECTED_KUBELET_VERSION:-}"
+REQUIRE_SCHEDULABLE="${REQUIRE_SCHEDULABLE:-}"
+SMOKE_TEST="${SMOKE_TEST:-}"
+SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-300}"
+SMOKE_POLL_INTERVAL="${SMOKE_POLL_INTERVAL:-10}"
 
 # These are passed to the remote interpreter's environment, so reject anything that
 # is not a plain integer rather than shipping it to the master. MIN_NODE_COUNT is
 # allowed to be empty, which means "no floor".
-for var in HEALTH_TIMEOUT HEALTH_POLL_INTERVAL MAX_RESTART_COUNT; do
+for var in HEALTH_TIMEOUT HEALTH_POLL_INTERVAL MAX_RESTART_COUNT SMOKE_TIMEOUT SMOKE_POLL_INTERVAL; do
   case "${!var}" in
     "" | *[!0-9]*)
       echo "ERROR: ${var} must be a non-negative integer, got: ${!var}" >&2
@@ -72,10 +85,29 @@ case "$MIN_NODE_COUNT" in
     ;;
 esac
 
+# Validated here, on the runner, rather than discovered as a mismatch after a
+# 45-minute upgrade: a typo'd version would otherwise fail the assertion on every
+# node and read exactly like a real failed upgrade. The pattern is the one
+# GlueKube's own preflight enforces for kubernetes_version.
+if [ -n "$EXPECTED_KUBELET_VERSION" ]; then
+  if ! printf '%s' "$EXPECTED_KUBELET_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "ERROR: EXPECTED_KUBELET_VERSION must look like v1.34.5, got: ${EXPECTED_KUBELET_VERSION}" >&2
+    echo "This is the Kubernetes version the nodes must report, not the GlueKube" >&2
+    echo "docker tag -- pass v1.34.5, not v1.34.5-gluekube.33." >&2
+    exit 1
+  fi
+fi
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REMOTE_SCRIPT="${SCRIPT_DIR}/cluster_health.py"
 if [ ! -f "$REMOTE_SCRIPT" ]; then
   echo "ERROR: cluster_health.py not found next to this script (${REMOTE_SCRIPT})" >&2
+  exit 1
+fi
+
+SMOKE_SCRIPT="${SCRIPT_DIR}/cluster_smoke.py"
+if [ -n "$SMOKE_TEST" ] && [ ! -f "$SMOKE_SCRIPT" ]; then
+  echo "ERROR: SMOKE_TEST is set but cluster_smoke.py is not next to this script (${SMOKE_SCRIPT})" >&2
   exit 1
 fi
 
@@ -257,12 +289,33 @@ fi
 echo "==> Step 5: Running cluster health assertions on ${MASTER_HOST} (deadline ${HEALTH_TIMEOUT}s)..."
 # The script arrives on stdin, so nothing is interpolated into a shell string. All
 # knobs are integer-validated above, so `env VAR=value` is safe to build by hand.
+# EXPECTED_KUBELET_VERSION is quoted because it is the one value here that is not
+# an integer. It is regex-validated above, so it cannot contain a shell
+# metacharacter, and the quotes keep an empty value from eating the next word.
 "${SSH_TO_MASTER[@]}" \
   "sudo env KUBECONFIG=/etc/kubernetes/admin.conf \
      HEALTH_TIMEOUT=${HEALTH_TIMEOUT} \
      HEALTH_POLL_INTERVAL=${HEALTH_POLL_INTERVAL} \
      MAX_RESTART_COUNT=${MAX_RESTART_COUNT} \
      MIN_NODE_COUNT=${MIN_NODE_COUNT} \
+     EXPECTED_KUBELET_VERSION='${EXPECTED_KUBELET_VERSION}' \
+     REQUIRE_SCHEDULABLE='${REQUIRE_SCHEDULABLE}' \
      python3 -" < "$REMOTE_SCRIPT"
 
 echo "Cluster is reachable and every assertion passed."
+
+# Deliberately after the assertions, not instead of them: the smoke test asks
+# whether the cluster still WORKS, which is only a meaningful question once its
+# objects are known healthy. A smoke failure on an already-degraded cluster would
+# just be a second symptom of the same cause.
+if [ -n "$SMOKE_TEST" ]; then
+  echo ""
+  echo "==> Step 6: Running post-upgrade smoke checks on ${MASTER_HOST} (deadline ${SMOKE_TIMEOUT}s)..."
+  "${SSH_TO_MASTER[@]}" \
+    "sudo env KUBECONFIG=/etc/kubernetes/admin.conf \
+       SMOKE_TIMEOUT=${SMOKE_TIMEOUT} \
+       SMOKE_POLL_INTERVAL=${SMOKE_POLL_INTERVAL} \
+       python3 -" < "$SMOKE_SCRIPT"
+
+  echo "Smoke checks passed: apiserver ready, services have endpoints, DNS resolves."
+fi

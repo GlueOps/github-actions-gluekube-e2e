@@ -18,6 +18,10 @@ cluster that fixes its nodes only after its pods have degraded still fails:
   N2  every node reports condition Ready=True
   N3  at least one control-plane node exists, and every control-plane node is Ready
   N4  at least MIN_NODE_COUNT nodes are Ready          (only when MIN_NODE_COUNT is set)
+  N5  no node is cordoned or carries a leftover drain taint
+                                                       (only when REQUIRE_SCHEDULABLE)
+  V1  every node runs EXPECTED_KUBELET_VERSION, and they all agree with each other
+                                                  (only when EXPECTED_KUBELET_VERSION)
   P1  every pod is healthy: phase Succeeded (completed Jobs are fine), or phase
       Running with every containerStatuses[].ready true
   P2  no container has restartCount above MAX_RESTART_COUNT
@@ -28,11 +32,30 @@ cluster has no NotReady nodes and no Pending pods, so without them it would pass
 vacuously -- which is exactly how the old check reported green on a cluster that
 had never come up.
 
+N5 and V1 exist for the UPGRADE test and are both off by default, so a plain
+apply run asserts exactly what it always did.
+
+  N5  N2 deliberately reads the Ready *condition*, and a cordoned node is still
+      Ready=True -- so a node left SchedulingDisabled passes N2. That is the
+      normal failure of GlueKube's upgrade playbook: it cordons, drains, upgrades
+      and uncordons every node one at a time, and the uncordon is a separate task
+      rather than an `always:`, so anything failing in between strands the node.
+      GlueKube's own readme tells you to run `kubectl uncordon <node>` by hand.
+
+  V1  Nothing else here looks at a version at all, so a cluster whose upgrade
+      silently did nothing is indistinguishable from one that upgraded cleanly:
+      both are Ready with healthy pods. V1 is what makes the upgrade test a test.
+      Note it asserts CONVERGENCE on the expected version, not that a number
+      changed -- a GlueKube-only bump keeps the same Kubernetes version, and the
+      caller is responsible for not asking for a no-op upgrade.
+
 Environment:
   HEALTH_TIMEOUT        overall deadline, seconds        (default 900)
   HEALTH_POLL_INTERVAL  seconds between polls            (default 15)
   MIN_NODE_COUNT        floor on Ready nodes, optional   (unset = no floor)
   MAX_RESTART_COUNT     per-container restart ceiling    (default 3)
+  EXPECTED_KUBELET_VERSION  e.g. v1.34.5, optional       (unset = V1 skipped)
+  REQUIRE_SCHEDULABLE   1/true/yes to enable N5          (unset = N5 skipped)
   KUBECONFIG            (default /etc/kubernetes/admin.conf)
 
 Exit status:
@@ -57,6 +80,12 @@ CONTROL_PLANE_LABELS = (
 # cluster would otherwise print hundreds of lines every poll and bury the tally.
 MAX_LISTED = 5
 
+# kubectl sets this taint alongside spec.unschedulable when it cordons. Checked
+# as well as the flag because they are set by different paths -- kubectl cordon
+# writes both, but a controller or a hand-applied taint can leave one without the
+# other, and either one still stops the scheduler placing work on the node.
+UNSCHEDULABLE_TAINT = "node.kubernetes.io/unschedulable"
+
 
 def _int_env(name, default):
     raw = os.environ.get(name, "")
@@ -69,10 +98,20 @@ def _int_env(name, default):
         sys.exit(2)
 
 
+def _bool_env(name):
+    """Opt-in flag. Anything not clearly true is false -- an assertion that turns
+    itself on by accident is worse than one that stays off."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 HEALTH_TIMEOUT = _int_env("HEALTH_TIMEOUT", 900)
 HEALTH_POLL_INTERVAL = _int_env("HEALTH_POLL_INTERVAL", 15)
 MAX_RESTART_COUNT = _int_env("MAX_RESTART_COUNT", 3)
 MIN_NODE_COUNT = _int_env("MIN_NODE_COUNT", 0)  # 0 == unset == no floor
+# "" == unset == V1 skipped. Deliberately not defaulted to anything: guessing a
+# version would turn a skipped assertion into a wrong one.
+EXPECTED_KUBELET_VERSION = os.environ.get("EXPECTED_KUBELET_VERSION", "").strip()
+REQUIRE_SCHEDULABLE = _bool_env("REQUIRE_SCHEDULABLE")
 
 os.environ.setdefault("KUBECONFIG", "/etc/kubernetes/admin.conf")
 
@@ -117,16 +156,39 @@ def truncate(items):
 # --------------------------------------------------------------------------
 
 def check_nodes(nodes):
-    """Evaluate N1-N4. Returns (failures, progress_line)."""
+    """Evaluate N1-N5 and V1. Returns (failures, progress_line)."""
     failures = []
     total = len(nodes)
 
     ready_names, not_ready_names = [], []
     cp_total, cp_not_ready = 0, []
+    cordoned = []            # N5: name -> why, as "node(flag)" / "node(taint)"
+    versions = {}            # V1: kubeletVersion -> [node names]
 
     for node in nodes:
         name = node.get("metadata", {}).get("name", "<unnamed>")
         labels = node.get("metadata", {}).get("labels") or {}
+        spec = node.get("spec") or {}
+
+        # N5. Both markers are collected rather than short-circuited so the
+        # message can say which one is set -- "cordoned" and "tainted but not
+        # cordoned" are different bugs and get investigated differently.
+        if REQUIRE_SCHEDULABLE:
+            marks = []
+            if spec.get("unschedulable") is True:
+                marks.append("flag")
+            for taint in spec.get("taints") or []:
+                if taint.get("key") == UNSCHEDULABLE_TAINT:
+                    marks.append("taint")
+                    break
+            if marks:
+                cordoned.append("%s(%s)" % (name, "+".join(marks)))
+
+        # V1. Recorded for every node even when the assertion is off, so the
+        # progress line can always show what the cluster is running.
+        kubelet_version = ((node.get("status") or {}).get("nodeInfo") or {}).get(
+            "kubeletVersion") or "<unknown>"
+        versions.setdefault(kubelet_version, []).append(name)
 
         # The Ready *condition*, not the STATUS text column: a cordoned node
         # prints "Ready,SchedulingDisabled" but is still Ready=True, and the
@@ -162,12 +224,40 @@ def check_nodes(nodes):
     if MIN_NODE_COUNT and len(ready_names) < MIN_NODE_COUNT:
         failures.append("N4: only %d node(s) Ready, MIN_NODE_COUNT=%d"
                         % (len(ready_names), MIN_NODE_COUNT))
+    # N5
+    if cordoned:
+        failures.append(
+            "N5: %d node(s) not schedulable: %s "
+            "(recover with: kubectl uncordon <node>)"
+            % (len(cordoned), truncate(sorted(cordoned))))
+    # V1
+    if EXPECTED_KUBELET_VERSION and total:
+        wrong = sorted(
+            node
+            for version, names in versions.items()
+            if version != EXPECTED_KUBELET_VERSION
+            for node in names
+        )
+        if wrong:
+            failures.append(
+                "V1: %d of %d node(s) are not on kubelet %s (found: %s): %s"
+                % (len(wrong), total, EXPECTED_KUBELET_VERSION,
+                   ", ".join("%s=%d" % (v, len(n)) for v, n in sorted(versions.items())),
+                   truncate(wrong)))
 
     line = "Nodes: %d/%d Ready" % (len(ready_names), total)
     if cp_total:
         line += ", %d control-plane" % cp_total
     if not_ready_names:
         line += ", not ready: %s" % truncate(sorted(not_ready_names))
+    if cordoned:
+        line += ", cordoned: %s" % truncate(sorted(cordoned))
+    if EXPECTED_KUBELET_VERSION and versions:
+        # Only when V1 is on. With it off the progress line stays byte-identical
+        # to what it was before these assertions existed, which is what lets the
+        # nightly adopt this version with no behaviour change to review.
+        line += ", kubelet %s" % ", ".join(
+            "%s(%d)" % (v, len(n)) for v, n in sorted(versions.items()))
     return failures, line
 
 
@@ -279,6 +369,20 @@ def dump_diagnostics(unhealthy_refs):
             print("(diagnostic raised: %s)" % exc)
 
     show("kubectl get nodes -o wide", ["get", "nodes", "-o", "wide"])
+
+    # `-o wide` shows VERSION but renders cordon only inside the STATUS column,
+    # and neither is greppable per node. A V1 or N5 failure is about exactly
+    # these two fields, so print them explicitly rather than making the reader
+    # re-derive them -- the cluster is destroyed minutes later and cannot be
+    # inspected by hand afterwards.
+    if EXPECTED_KUBELET_VERSION or REQUIRE_SCHEDULABLE:
+        show("node kubelet version / schedulability",
+             ["get", "nodes", "-o", "custom-columns="
+              "NAME:.metadata.name,"
+              "KUBELET:.status.nodeInfo.kubeletVersion,"
+              "UNSCHEDULABLE:.spec.unschedulable,"
+              "TAINTS:.spec.taints[*].key"])
+
     show("kubectl get pods -A -o wide", ["get", "pods", "-A", "-o", "wide"])
 
     for ns, name in unhealthy_refs[:20]:
@@ -314,8 +418,23 @@ def summarise(passed, failures, node_line, pod_line, elapsed, attempts):
         for failure in failures:
             print("  - %s" % failure)
     else:
-        print("All assertions passed (N1-N4, P1-P3).")
+        print("All assertions passed (%s)." % ", ".join(_enabled_assertions()))
     print("=========================================================")
+
+
+def _enabled_assertions():
+    """Which assertion groups actually ran, so a PASS says what it proved.
+
+    A pass line reading "N1-N4, P1-P3" on an upgrade run would be misleading: it
+    would not tell you whether the version assertion was among them.
+    """
+    groups = ["N1-N4"]
+    if REQUIRE_SCHEDULABLE:
+        groups.append("N5")
+    if EXPECTED_KUBELET_VERSION:
+        groups.append("V1")
+    groups.append("P1-P3")
+    return groups
 
 
 # --------------------------------------------------------------------------
@@ -325,6 +444,13 @@ def main():
           "MAX_RESTART_COUNT=%d, MIN_NODE_COUNT=%s"
           % (HEALTH_TIMEOUT, HEALTH_POLL_INTERVAL, MAX_RESTART_COUNT,
              MIN_NODE_COUNT or "unset"))
+    # Printed only when on, so the default run's log is unchanged. Worth saying
+    # out loud when on: "which version did it demand" is the first question of
+    # any V1 failure, and it should be answerable from the top of the log.
+    if EXPECTED_KUBELET_VERSION or REQUIRE_SCHEDULABLE:
+        print("Upgrade assertions: EXPECTED_KUBELET_VERSION=%s, REQUIRE_SCHEDULABLE=%s"
+              % (EXPECTED_KUBELET_VERSION or "unset",
+                 "yes" if REQUIRE_SCHEDULABLE else "no"))
 
     started = time.time()
     deadline = started + HEALTH_TIMEOUT

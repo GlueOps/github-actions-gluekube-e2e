@@ -53,6 +53,50 @@ inputs:
     required: false
     default: "3"
 
+  # ---------------------------------------------------------------------------
+  # Upgrade-test inputs. All off by default, so an apply-only caller asserts
+  # exactly what it did before these existed.
+  # ---------------------------------------------------------------------------
+  expected-kubelet-version:
+    description: >-
+      Kubernetes version every node must report, e.g. "v1.34.5". This is the
+      version, NOT the GlueKube docker tag: pass v1.34.5, not v1.34.5-gluekube.33.
+      Without it nothing here looks at a version at all, so a cluster whose
+      upgrade silently did nothing passes every other assertion — it is Ready with
+      healthy pods, just on the old version. Unset by default because it is
+      meaningless for a build-from-scratch run, which has nothing to compare to.
+    required: false
+    default: ""
+  require-schedulable:
+    description: >-
+      Set to "1" to fail if any node is cordoned or carries a leftover drain
+      taint. Off by default because the Ready-condition check deliberately treats
+      a cordoned node as healthy. Turn it on after an upgrade: the playbook
+      cordons, drains and uncordons each node in turn, and the uncordon is a
+      separate task rather than an `always:`, so anything failing in between
+      strands that node SchedulingDisabled where nothing else here would notice.
+    required: false
+    default: ""
+  smoke-test:
+    description: >-
+      Set to "1" to run the smoke checks after the assertions pass: apiserver
+      /readyz, Service endpoints, and a real DNS query to the kube-dns ClusterIP.
+      That last one exercises kube-proxy service routing and CoreDNS answering,
+      both re-applied by `kubeadm upgrade apply` and neither covered by "every pod
+      is Ready". Creates no pods and pulls no images.
+    required: false
+    default: ""
+  smoke-timeout:
+    description: >-
+      Deadline for the smoke checks in seconds. Keep it, plus health-timeout,
+      inside the caller job's timeout-minutes.
+    required: false
+    default: "300"
+  smoke-poll-interval:
+    description: "Seconds between smoke attempts"
+    required: false
+    default: "10"
+
 runs:
   using: composite
   steps:
@@ -74,4 +118,11 @@ runs:
         MAX_RESTART_COUNT: ${{ inputs.max-restart-count || '3' }}
         # No `||` fallback: empty is a meaningful value here (no floor).
         MIN_NODE_COUNT: ${{ inputs.min-node-count }}
+        # Same reasoning — for all three of these, empty means "assertion off",
+        # so a `||` default would silently switch them on for every caller.
+        EXPECTED_KUBELET_VERSION: ${{ inputs.expected-kubelet-version }}
+        REQUIRE_SCHEDULABLE: ${{ inputs.require-schedulable }}
+        SMOKE_TEST: ${{ inputs.smoke-test }}
+        SMOKE_TIMEOUT: ${{ inputs.smoke-timeout || '300' }}
+        SMOKE_POLL_INTERVAL: ${{ inputs.smoke-poll-interval || '10' }}
       run: bash "${{ github.action_path }}/check_cluster_health.sh"

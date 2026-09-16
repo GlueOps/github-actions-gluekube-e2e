@@ -32,8 +32,7 @@ inputs:
     description: >-
       How long to wait for the bastion to report ready before giving up. This
       replaces the two fixed 300s settle sleeps that used to cost every run ten
-      minutes regardless of how fast the bastion actually came up. A bastion
-      re-pend is only attempted with at least bastion-retry-backoff + 120s left.
+      minutes regardless of how fast the bastion actually came up.
     required: false
     default: "600"
   bastion-poll-interval:
@@ -41,14 +40,11 @@ inputs:
     required: false
     default: "15"
   bastion-max-retries:
-    description: >-
-      How many times a bastion whose provisioning `failed` is set back to pending
-      before giving up. 2 means up to 3 provisioning attempts in total. A bastion
-      already failed at the first check uses one of them.
+    description: "Times a failed bastion is set back to pending before giving up"
     required: false
     default: "2"
   bastion-retry-backoff:
-    description: "Seconds to wait after a bastion provisioning failure before setting it back to pending"
+    description: "Seconds to wait before setting a failed bastion back to pending"
     required: false
     default: "60"
 

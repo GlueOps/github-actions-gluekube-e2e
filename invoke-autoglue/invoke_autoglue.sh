@@ -19,9 +19,8 @@
 #   POLL_TIMEOUT_SECONDS   give up on the run after this long (default 2700 = 45m)
 #   BASTION_READY_TIMEOUT  how long to wait for the bastion to report ready (default 600)
 #   BASTION_POLL_INTERVAL  seconds between bastion status checks (default 15)
-#   BASTION_MAX_RETRIES    times a `failed` bastion is set back to pending (default 2,
-#                          i.e. up to 3 provisioning attempts in total)
-#   BASTION_RETRY_BACKOFF  seconds to wait after a failure before re-pending (default 60)
+#   BASTION_MAX_RETRIES    times a failed bastion is set back to pending (default 2)
+#   BASTION_RETRY_BACKOFF  seconds to wait before re-pending a failed bastion (default 60)
 set -euo pipefail
 
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
@@ -35,9 +34,6 @@ POLL_TIMEOUT_SECONDS="${POLL_TIMEOUT_SECONDS:-2700}"
 # time from a fast run and actually waits for the condition on a slow one.
 BASTION_READY_TIMEOUT="${BASTION_READY_TIMEOUT:-600}"
 BASTION_POLL_INTERVAL="${BASTION_POLL_INTERVAL:-15}"
-# A bastion that fails provisioning stays `failed` until something sets it back to
-# pending; AutoGlue often tries before the fresh VM has settled, so it gets a bounded
-# number of re-pends. A bastion already `failed` at the first poll uses one of them.
 BASTION_MAX_RETRIES="${BASTION_MAX_RETRIES:-2}"
 BASTION_RETRY_BACKOFF="${BASTION_RETRY_BACKOFF:-60}"
 for var in BASTION_READY_TIMEOUT BASTION_POLL_INTERVAL BASTION_MAX_RETRIES BASTION_RETRY_BACKOFF; do
@@ -107,10 +103,7 @@ get_bastion() {
     -H "x-org-id: ${ORG_ID}" 2>/dev/null | jq -r '.[0] // empty'
 }
 
-# PATCH the bastion back to pending so AutoGlue provisions it again, then re-read it
-# so the log shows whether the change took. Never trips `set -e`: a rejected or
-# failed PATCH is logged and reported via the return code, and the caller tries
-# again on the next poll.
+# Set the bastion back to pending. Returns non-zero on failure instead of exiting.
 repend_bastion() {
   local out code after_status
   if ! out=$(curl -sS --http1.1 -X PATCH "${BASE_URL}/servers/${BASTION_ID}" \
@@ -132,8 +125,6 @@ repend_bastion() {
   echo "  bastion status right after re-pend: ${after_status:-unknown}"
 }
 
-# Best-effort diagnostics for a bastion that never came up. Servers carry no error
-# field today, so the cluster's last_error is usually the useful one.
 print_bastion_diagnostics() {
   local cluster_err server_err
   cluster_err=$(curl -sfS --http1.1 -G "${BASE_URL}/clusters" \
@@ -148,17 +139,12 @@ print_bastion_diagnostics() {
   return 0
 }
 
-# A new provisioning attempt needs at least this long to have a real chance of
-# finishing before the deadline; re-pending with less left would only waste the run.
-# (So a bastion-ready-timeout under backoff + this leaves no room for any retry.)
+# Minimum time left before the deadline for a re-pend to be worth it.
 MIN_ATTEMPT_SECONDS=120
 MAX_ATTEMPTS=$(( BASTION_MAX_RETRIES + 1 ))
 
-# FAILED_AT starts the backoff window: when a failure is first seen, and again after
-# every accepted re-pend. A `failed` read inside the window is either the backoff
-# itself or our own not-yet-applied PATCH, so it never counts as a new failure; a
-# bastion still `failed` once the window is over costs a retry either way, which keeps
-# the number of re-pends bounded by BASTION_MAX_RETRIES no matter what the API does.
+# FAILED_AT starts the backoff window; it is reset after every re-pend, so a stale
+# `failed` read right after a PATCH is not counted as a new failure.
 SECONDS=0
 RETRIES=0
 FAILED_AT=""
@@ -189,7 +175,6 @@ while [ "$SECONDS" -lt "$BASTION_READY_TIMEOUT" ]; do
       break
       ;;
     pending|provisioning)
-      # An attempt is in flight. Leave it alone: PATCHing now would reset its progress.
       FAILED_AT=""
       ;;
     failed)
@@ -206,8 +191,6 @@ while [ "$SECONDS" -lt "$BASTION_READY_TIMEOUT" ]; do
         fi
         echo "  re-pending the bastion in ${BASTION_RETRY_BACKOFF}s ($(( BASTION_READY_TIMEOUT - SECONDS ))s left before the deadline)"
       fi
-      # The backoff gives the VM time to settle (cloud-init, reboots) before AutoGlue
-      # tries again. Polling continues meanwhile, so the deadline is still honoured.
       if [ $(( SECONDS - FAILED_AT )) -ge "$BASTION_RETRY_BACKOFF" ]; then
         if [ "$RETRIES" -ge "$BASTION_MAX_RETRIES" ]; then
           BASTION_FAIL_REASON="bastion still failed ${BASTION_RETRY_BACKOFF}s after re-pend ${RETRIES}/${BASTION_MAX_RETRIES}, no retries left"
@@ -225,8 +208,6 @@ while [ "$SECONDS" -lt "$BASTION_READY_TIMEOUT" ]; do
       fi
       ;;
     *)
-      # Unknown status: wait rather than PATCH, which could reset progress on a
-      # state this script does not know about.
       echo "  unrecognised bastion status '${BASTION_STATUS}', waiting"
       ;;
   esac

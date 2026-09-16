@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/GlueOps/github-actions-gluekube-e2e/compare/v1.1.0...v1.1.1) (2026-09-16)
+
+
+### Bug Fixes
+
+* re-pend bastion when provisioning fails ([#8](https://github.com/GlueOps/github-actions-gluekube-e2e/issues/8)) ([5730925](https://github.com/GlueOps/github-actions-gluekube-e2e/commit/5730925cec1bae5d15b5f46800554e4ff4f94815))
+
 ## [1.1.0](https://github.com/GlueOps/github-actions-gluekube-e2e/compare/v1.0.1...v1.1.0) (2026-09-08)
 
 

@@ -32,7 +32,8 @@ inputs:
     description: >-
       How long to wait for the bastion to report ready before giving up. This
       replaces the two fixed 300s settle sleeps that used to cost every run ten
-      minutes regardless of how fast the bastion actually came up.
+      minutes regardless of how fast the bastion actually came up. A bastion
+      re-pend is only attempted with at least bastion-retry-backoff + 120s left.
     required: false
     default: "600"
   bastion-poll-interval:

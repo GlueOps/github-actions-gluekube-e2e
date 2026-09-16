@@ -1,6 +1,6 @@
 name: "GlueKube: invoke AutoGlue action"
 description: >-
-  Resolve the AutoGlue org/cluster/action by name, make sure the bastion is ready,
+  Resolve the AutoGlue org/cluster/action by name, wait for the bastion to be ready (re-pending it if provisioning fails),
   trigger an action run, and poll until it succeeds or fails.
 
 inputs:
@@ -39,6 +39,14 @@ inputs:
     description: "Seconds between bastion status checks"
     required: false
     default: "15"
+  bastion-max-retries:
+    description: "Times a failed bastion is set back to pending before giving up"
+    required: false
+    default: "2"
+  bastion-retry-backoff:
+    description: "Seconds to wait before setting a failed bastion back to pending"
+    required: false
+    default: "60"
 
 runs:
   using: composite
@@ -64,4 +72,6 @@ runs:
         POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout-seconds || '2700' }}
         BASTION_READY_TIMEOUT: ${{ inputs.bastion-ready-timeout || '600' }}
         BASTION_POLL_INTERVAL: ${{ inputs.bastion-poll-interval || '15' }}
+        BASTION_MAX_RETRIES: ${{ inputs.bastion-max-retries || '2' }}
+        BASTION_RETRY_BACKOFF: ${{ inputs.bastion-retry-backoff || '60' }}
       run: bash "${{ github.action_path }}/invoke_autoglue.sh"

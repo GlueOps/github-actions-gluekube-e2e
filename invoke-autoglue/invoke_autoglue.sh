@@ -3,7 +3,7 @@
 # Invoke an AutoGlue action against the cluster created by `tofu apply`.
 #
 # Resolves the org id by name, the cluster id by name, finds the action id by its
-# make target, makes sure the bastion is ready (nudging it back to pending if not),
+# make target, waits for the bastion to be ready (re-pending it if provisioning fails),
 # triggers an action run (the "kubernetes setup" invocation), then polls the run
 # status until it succeeds (exit 0) or fails (exit 1). Called by the test-apply
 # workflow after apply. Requires `curl` and `jq` on PATH.
@@ -19,6 +19,8 @@
 #   POLL_TIMEOUT_SECONDS   give up on the run after this long (default 2700 = 45m)
 #   BASTION_READY_TIMEOUT  how long to wait for the bastion to report ready (default 600)
 #   BASTION_POLL_INTERVAL  seconds between bastion status checks (default 15)
+#   BASTION_MAX_RETRIES    times a failed bastion is set back to pending (default 2)
+#   BASTION_RETRY_BACKOFF  seconds to wait before re-pending a failed bastion (default 60)
 set -euo pipefail
 
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
@@ -32,6 +34,14 @@ POLL_TIMEOUT_SECONDS="${POLL_TIMEOUT_SECONDS:-2700}"
 # time from a fast run and actually waits for the condition on a slow one.
 BASTION_READY_TIMEOUT="${BASTION_READY_TIMEOUT:-600}"
 BASTION_POLL_INTERVAL="${BASTION_POLL_INTERVAL:-15}"
+BASTION_MAX_RETRIES="${BASTION_MAX_RETRIES:-2}"
+BASTION_RETRY_BACKOFF="${BASTION_RETRY_BACKOFF:-60}"
+for var in BASTION_READY_TIMEOUT BASTION_POLL_INTERVAL BASTION_MAX_RETRIES BASTION_RETRY_BACKOFF; do
+  if ! [[ "${!var}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "ERROR: ${var} must be a non-negative integer, got '${!var}'"
+    exit 1
+  fi
+done
 
 : "${BASE_URL:?BASE_URL is required}"
 : "${API_KEY:?API_KEY is required}"
@@ -83,7 +93,7 @@ if [ -z "$ACTION_ID" ] || [ "$ACTION_ID" = "null" ]; then
 fi
 echo "Found action_id: ${ACTION_ID}"
 
-echo "==> Step 4: Waiting for the bastion to report ready (deadline ${BASTION_READY_TIMEOUT}s)..."
+echo "==> Step 4: Waiting for the bastion to report ready (deadline ${BASTION_READY_TIMEOUT}s, up to ${BASTION_MAX_RETRIES} re-pend(s) on failure)..."
 # Fetch the bastion record. Echoes the server object, empty if there is none yet.
 get_bastion() {
   curl -sfS --http1.1 -G "${BASE_URL}/servers" \
@@ -93,9 +103,54 @@ get_bastion() {
     -H "x-org-id: ${ORG_ID}" 2>/dev/null | jq -r '.[0] // empty'
 }
 
+# Set the bastion back to pending. Returns non-zero on failure instead of exiting.
+repend_bastion() {
+  local out code after_status
+  if ! out=$(curl -sS --http1.1 -X PATCH "${BASE_URL}/servers/${BASTION_ID}" \
+    -H "accept: application/json" \
+    -H "content-type: application/json" \
+    -H "X-API-KEY: ${API_KEY}" \
+    -H "x-org-id: ${ORG_ID}" \
+    --data-raw '{"status":"pending"}' \
+    -w '\n%{http_code}' 2>&1); then
+    echo "  WARN: re-pend PATCH failed: ${out}"
+    return 1
+  fi
+  code="${out##*$'\n'}"
+  if [[ "$code" != 2* ]]; then
+    echo "  WARN: re-pend PATCH returned HTTP ${code}: ${out%$'\n'*}"
+    return 1
+  fi
+  after_status=$(get_bastion | jq -r '.status // empty' || true)
+  echo "  bastion status right after re-pend: ${after_status:-unknown}"
+}
+
+print_bastion_diagnostics() {
+  local cluster_err server_err
+  cluster_err=$(curl -sfS --http1.1 -G "${BASE_URL}/clusters" \
+    --data-urlencode "q=${CLUSTER_NAME}" \
+    -H "accept: application/json" \
+    -H "X-API-KEY: ${API_KEY}" \
+    -H "x-org-id: ${ORG_ID}" 2>/dev/null \
+    | jq -r --arg id "$CLUSTER_ID" '.[] | select(.id == $id) | .last_error // empty' || true)
+  server_err=$(echo "${BASTION:-}" | jq -r '.last_error // .error // empty' 2>/dev/null || true)
+  [ -n "$cluster_err" ] && echo "  cluster last_error: ${cluster_err}"
+  [ -n "$server_err" ] && echo "  bastion error: ${server_err}"
+  return 0
+}
+
+# Minimum time left before the deadline for a re-pend to be worth it.
+MIN_ATTEMPT_SECONDS=120
+MAX_ATTEMPTS=$(( BASTION_MAX_RETRIES + 1 ))
+
+# FAILED_AT starts the backoff window; it is reset after every re-pend, so a stale
+# `failed` read right after a PATCH is not counted as a new failure.
 SECONDS=0
-NUDGED=false
+RETRIES=0
+FAILED_AT=""
+BASTION=""
 BASTION_READY=false
+BASTION_FAIL_REASON=""
 LAST_BASTION_STATUS="unknown (no successful check yet)"
 
 while [ "$SECONDS" -lt "$BASTION_READY_TIMEOUT" ]; do
@@ -103,6 +158,7 @@ while [ "$SECONDS" -lt "$BASTION_READY_TIMEOUT" ]; do
   if [ -z "$BASTION" ]; then
     # Right after apply the record may not be visible yet. Transient until the
     # deadline, rather than an immediate hard failure.
+    LAST_BASTION_STATUS="no bastion server found"
     echo "  no bastion server yet (${SECONDS}s elapsed) - retrying in ${BASTION_POLL_INTERVAL}s"
     sleep "$BASTION_POLL_INTERVAL"
     continue
@@ -113,29 +169,55 @@ while [ "$SECONDS" -lt "$BASTION_READY_TIMEOUT" ]; do
   LAST_BASTION_STATUS="$BASTION_STATUS"
   echo "  bastion ${BASTION_ID} status: ${BASTION_STATUS} (${SECONDS}s elapsed)"
 
-  if [ "$BASTION_STATUS" = "ready" ]; then
-    BASTION_READY=true
-    break
-  fi
-
-  # Nudge once, not every round: repeatedly PATCHing back to pending would reset
-  # progress the provisioner is making.
-  if [ "$NUDGED" = false ]; then
-    echo "  bastion is not ready, setting its status back to pending..."
-    curl -sfS --http1.1 -X PATCH "${BASE_URL}/servers/${BASTION_ID}" \
-      -H "accept: application/json" \
-      -H "content-type: application/json" \
-      -H "X-API-KEY: ${API_KEY}" \
-      -H "x-org-id: ${ORG_ID}" \
-      --data-raw '{"status":"pending"}' > /dev/null
-    NUDGED=true
-  fi
+  case "$BASTION_STATUS" in
+    ready)
+      BASTION_READY=true
+      break
+      ;;
+    pending|provisioning)
+      FAILED_AT=""
+      ;;
+    failed)
+      if [ -z "$FAILED_AT" ]; then
+        FAILED_AT=$SECONDS
+        echo "  bastion provisioning attempt $(( RETRIES + 1 ))/${MAX_ATTEMPTS} failed"
+        if [ "$RETRIES" -ge "$BASTION_MAX_RETRIES" ]; then
+          BASTION_FAIL_REASON="bastion failed on attempt $(( RETRIES + 1 ))/${MAX_ATTEMPTS}, no retries left"
+          break
+        fi
+        if [ $(( BASTION_READY_TIMEOUT - SECONDS )) -lt $(( BASTION_RETRY_BACKOFF + MIN_ATTEMPT_SECONDS )) ]; then
+          BASTION_FAIL_REASON="bastion failed with $(( BASTION_READY_TIMEOUT - SECONDS ))s left before the deadline, not enough for another attempt"
+          break
+        fi
+        echo "  re-pending the bastion in ${BASTION_RETRY_BACKOFF}s ($(( BASTION_READY_TIMEOUT - SECONDS ))s left before the deadline)"
+      fi
+      if [ $(( SECONDS - FAILED_AT )) -ge "$BASTION_RETRY_BACKOFF" ]; then
+        if [ "$RETRIES" -ge "$BASTION_MAX_RETRIES" ]; then
+          BASTION_FAIL_REASON="bastion still failed ${BASTION_RETRY_BACKOFF}s after re-pend ${RETRIES}/${BASTION_MAX_RETRIES}, no retries left"
+          break
+        fi
+        if [ $(( BASTION_READY_TIMEOUT - SECONDS )) -lt "$MIN_ATTEMPT_SECONDS" ]; then
+          BASTION_FAIL_REASON="bastion failed with $(( BASTION_READY_TIMEOUT - SECONDS ))s left before the deadline, not enough for another attempt"
+          break
+        fi
+        if repend_bastion; then
+          RETRIES=$(( RETRIES + 1 ))
+          FAILED_AT=$SECONDS
+          echo "  re-pended the bastion (retry ${RETRIES}/${BASTION_MAX_RETRIES})"
+        fi
+      fi
+      ;;
+    *)
+      echo "  unrecognised bastion status '${BASTION_STATUS}', waiting"
+      ;;
+  esac
 
   sleep "$BASTION_POLL_INTERVAL"
 done
 
 if [ "$BASTION_READY" != true ]; then
-  echo "ERROR: bastion did not report ready within ${BASTION_READY_TIMEOUT}s — last status: ${LAST_BASTION_STATUS}"
+  echo "ERROR: ${BASTION_FAIL_REASON:-bastion did not report ready within ${BASTION_READY_TIMEOUT}s} — last status: ${LAST_BASTION_STATUS}, re-pends used: ${RETRIES}/${BASTION_MAX_RETRIES}"
+  print_bastion_diagnostics
   exit 1
 fi
 echo "Bastion is ready after ${SECONDS}s."

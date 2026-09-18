@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/GlueOps/github-actions-gluekube-e2e/compare/v1.1.1...v1.1.2) (2026-09-18)
+
+
+### Miscellaneous Chores
+
+* update docs to mention autoglue creds and their mapping ([#10](https://github.com/GlueOps/github-actions-gluekube-e2e/issues/10)) ([e49573f](https://github.com/GlueOps/github-actions-gluekube-e2e/commit/e49573ff980da1ce332dab0fa318a1abf2211cda))
+
 ## [1.1.1](https://github.com/GlueOps/github-actions-gluekube-e2e/compare/v1.1.0...v1.1.1) (2026-09-16)
 
 

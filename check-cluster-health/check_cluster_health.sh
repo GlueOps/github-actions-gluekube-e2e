@@ -35,6 +35,10 @@
 #   SMOKE_TIMEOUT             smoke deadline in seconds         (default 300)
 #   SMOKE_POLL_INTERVAL       seconds between smoke attempts    (default 10)
 #
+# Optional, off by default:
+#   CHECK_ETCD                1 to assert every control-plane node's etcd
+#                             http://<InternalIP>:2381/metrics answers 200
+#
 # Isolation -- the worst bug this checker can have
 #   The failure mode that matters is a false PASS, not a false failure. If teardown
 #   failed on a previous run and its cluster is still up, an unfiltered server lookup
@@ -63,6 +67,7 @@ MIN_NODE_COUNT="${MIN_NODE_COUNT:-}"
 EXPECTED_KUBELET_VERSION="${EXPECTED_KUBELET_VERSION:-}"
 REQUIRE_SCHEDULABLE="${REQUIRE_SCHEDULABLE:-}"
 SMOKE_TEST="${SMOKE_TEST:-}"
+CHECK_ETCD="${CHECK_ETCD:-}"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-300}"
 SMOKE_POLL_INTERVAL="${SMOKE_POLL_INTERVAL:-10}"
 
@@ -300,6 +305,7 @@ echo "==> Step 5: Running cluster health assertions on ${MASTER_HOST} (deadline 
      MIN_NODE_COUNT=${MIN_NODE_COUNT} \
      EXPECTED_KUBELET_VERSION='${EXPECTED_KUBELET_VERSION}' \
      REQUIRE_SCHEDULABLE='${REQUIRE_SCHEDULABLE}' \
+     CHECK_ETCD='${CHECK_ETCD}' \
      python3 -" < "$REMOTE_SCRIPT"
 
 echo "Cluster is reachable and every assertion passed."

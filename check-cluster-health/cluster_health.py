@@ -26,6 +26,8 @@ cluster that fixes its nodes only after its pods have degraded still fails:
       Running with every containerStatuses[].ready true
   P2  no container has restartCount above MAX_RESTART_COUNT
   P3  at least one pod exists
+  E1  every control-plane node's etcd /metrics endpoint, reached on the node's
+      InternalIP, answers HTTP 200                    (only when CHECK_ETCD)
 
 N1 and P3 are the guards that stop the checker asserting nothing: an empty
 cluster has no NotReady nodes and no Pending pods, so without them it would pass
@@ -49,6 +51,13 @@ apply run asserts exactly what it always did.
       changed -- a GlueKube-only bump keeps the same Kubernetes version, and the
       caller is responsible for not asking for a no-op upgrade.
 
+E1 is off by default too, and is the one assertion that does not go through
+kubectl: it talks to etcd directly at http://<InternalIP>:ETCD_METRICS_PORT/metrics
+for every control-plane node, so it still reports something useful when the
+apiserver itself is what is broken. It only asserts the endpoint answers 200.
+kubeadm binds the metrics listener to 127.0.0.1 by default, so this needs
+etcd's --listen-metrics-urls to include the node IP (or 0.0.0.0).
+
 Environment:
   HEALTH_TIMEOUT        overall deadline, seconds        (default 900)
   HEALTH_POLL_INTERVAL  seconds between polls            (default 15)
@@ -56,6 +65,8 @@ Environment:
   MAX_RESTART_COUNT     per-container restart ceiling    (default 3)
   EXPECTED_KUBELET_VERSION  e.g. v1.34.5, optional       (unset = V1 skipped)
   REQUIRE_SCHEDULABLE   1/true/yes to enable N5          (unset = N5 skipped)
+  CHECK_ETCD            1/true/yes to enable E1          (unset = E1 skipped)
+  ETCD_METRICS_PORT     etcd metrics port                (default 2381)
   KUBECONFIG            (default /etc/kubernetes/admin.conf)
 
 Exit status:
@@ -68,6 +79,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 CONTROL_PLANE_LABELS = (
     "node-role.kubernetes.io/control-plane",
@@ -112,6 +125,8 @@ MIN_NODE_COUNT = _int_env("MIN_NODE_COUNT", 0)  # 0 == unset == no floor
 # version would turn a skipped assertion into a wrong one.
 EXPECTED_KUBELET_VERSION = os.environ.get("EXPECTED_KUBELET_VERSION", "").strip()
 REQUIRE_SCHEDULABLE = _bool_env("REQUIRE_SCHEDULABLE")
+CHECK_ETCD = _bool_env("CHECK_ETCD")
+ETCD_METRICS_PORT = _int_env("ETCD_METRICS_PORT", 2381)
 
 os.environ.setdefault("KUBECONFIG", "/etc/kubernetes/admin.conf")
 
@@ -156,12 +171,16 @@ def truncate(items):
 # --------------------------------------------------------------------------
 
 def check_nodes(nodes):
-    """Evaluate N1-N5 and V1. Returns (failures, progress_line)."""
+    """Evaluate N1-N5 and V1. Returns (failures, progress_line, cp_ips).
+
+    cp_ips is [(name, InternalIP or None)] for every control-plane node, for E1.
+    """
     failures = []
     total = len(nodes)
 
     ready_names, not_ready_names = [], []
     cp_total, cp_not_ready = 0, []
+    cp_ips = []              # E1: (name, InternalIP or None)
     cordoned = []            # N5: name -> why, as "node(flag)" / "node(taint)"
     versions = {}            # V1: kubeletVersion -> [node names]
 
@@ -203,6 +222,12 @@ def check_nodes(nodes):
 
         if any(label in labels for label in CONTROL_PLANE_LABELS):
             cp_total += 1
+            internal_ip = None
+            for addr in (node.get("status") or {}).get("addresses") or []:
+                if addr.get("type") == "InternalIP":
+                    internal_ip = addr.get("address")
+                    break
+            cp_ips.append((name, internal_ip))
             if not ready:
                 cp_not_ready.append(name)
 
@@ -258,6 +283,57 @@ def check_nodes(nodes):
         # nightly adopt this version with no behaviour change to review.
         line += ", kubelet %s" % ", ".join(
             "%s(%d)" % (v, len(n)) for v, n in sorted(versions.items()))
+    return failures, line, cp_ips
+
+
+# --------------------------------------------------------------------------
+# etcd assertions
+# --------------------------------------------------------------------------
+
+def etcd_metrics_status(ip):
+    """GET http://ip:ETCD_METRICS_PORT/metrics. Returns (ok, reason). Never raises."""
+    url = "http://%s:%d/metrics" % (ip, ETCD_METRICS_PORT)
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            if resp.status == 200:
+                return True, "200"
+            return False, "HTTP %d" % resp.status
+    except urllib.error.HTTPError as exc:
+        return False, "HTTP %d" % exc.code
+    except urllib.error.URLError as exc:
+        return False, str(exc.reason)
+    except Exception as exc:  # noqa: BLE001 - a probe failure is a result, not a crash
+        return False, str(exc)
+
+
+def check_etcd(cp_ips):
+    """Evaluate E1. Returns (failures, progress_line)."""
+    failures = []
+    bad = []
+    refused = False
+    for name, ip in cp_ips:
+        if not ip:
+            bad.append("%s=no InternalIP" % name)
+            continue
+        ok, reason = etcd_metrics_status(ip)
+        if not ok:
+            bad.append("%s(%s)=%s" % (name, ip, reason))
+            refused = refused or "refused" in reason.lower()
+
+    # An empty cp_ips is already N3's failure; E1 would only repeat it.
+    if bad:
+        msg = "E1: %d etcd metrics endpoint(s) not OK: %s" % (len(bad), truncate(sorted(bad)))
+        if refused:
+            # kubeadm's default --listen-metrics-urls is http://127.0.0.1:2381,
+            # which refuses on the node IP. Say so, or a binding problem reads
+            # exactly like etcd being down.
+            msg += (" (connection refused: is etcd's --listen-metrics-urls bound "
+                    "to the node IP or 0.0.0.0, not just 127.0.0.1?)")
+        failures.append(msg)
+
+    line = "etcd: %d/%d metrics endpoints OK" % (len(cp_ips) - len(bad), len(cp_ips))
+    if bad:
+        line += ", failing: %s" % truncate(sorted(bad))
     return failures, line
 
 
@@ -405,7 +481,7 @@ def dump_diagnostics(unhealthy_refs):
     print("=========================================================")
 
 
-def summarise(passed, failures, node_line, pod_line, elapsed, attempts):
+def summarise(passed, failures, node_line, pod_line, elapsed, attempts, etcd_line=None):
     """Short verdict block, so a failed run is readable without scrolling."""
     print("")
     print("======================= SUMMARY =========================")
@@ -413,6 +489,8 @@ def summarise(passed, failures, node_line, pod_line, elapsed, attempts):
     print("Duration: %ds over %d poll(s), deadline %ds" % (elapsed, attempts, HEALTH_TIMEOUT))
     print("Final:    %s" % node_line)
     print("          %s" % pod_line)
+    if etcd_line:
+        print("          %s" % etcd_line)
     if failures:
         print("Failing assertions:")
         for failure in failures:
@@ -434,6 +512,8 @@ def _enabled_assertions():
     if EXPECTED_KUBELET_VERSION:
         groups.append("V1")
     groups.append("P1-P3")
+    if CHECK_ETCD:
+        groups.append("E1")
     return groups
 
 
@@ -447,6 +527,8 @@ def main():
     # Printed only when on, so the default run's log is unchanged. Worth saying
     # out loud when on: "which version did it demand" is the first question of
     # any V1 failure, and it should be answerable from the top of the log.
+    if CHECK_ETCD:
+        print("etcd assertions: CHECK_ETCD=yes, ETCD_METRICS_PORT=%d" % ETCD_METRICS_PORT)
     if EXPECTED_KUBELET_VERSION or REQUIRE_SCHEDULABLE:
         print("Upgrade assertions: EXPECTED_KUBELET_VERSION=%s, REQUIRE_SCHEDULABLE=%s"
               % (EXPECTED_KUBELET_VERSION or "unset",
@@ -457,6 +539,7 @@ def main():
     attempts = 0
     failures = ["no successful poll completed"]
     node_line = pod_line = "(never polled successfully)"
+    etcd_line = "(never polled successfully)" if CHECK_ETCD else None
     unhealthy_refs = []
 
     while True:
@@ -473,16 +556,21 @@ def main():
             failures = ["kubectl unavailable: %s" % (nodes if not node_ok else podlist)]
             print("WARN: %s  (elapsed %ds / %ds)" % (failures[0], elapsed, HEALTH_TIMEOUT))
         else:
-            node_failures, node_line = check_nodes(nodes.get("items") or [])
+            node_failures, node_line, cp_ips = check_nodes(nodes.get("items") or [])
             pod_failures, pod_line, unhealthy_refs = check_pods(podlist.get("items") or [])
             failures = node_failures + pod_failures
+            if CHECK_ETCD:
+                etcd_failures, etcd_line = check_etcd(cp_ips)
+                failures += etcd_failures
 
             print("%s  (elapsed %ds / %ds)" % (node_line, elapsed, HEALTH_TIMEOUT))
             print("%s  (elapsed %ds / %ds)" % (pod_line, elapsed, HEALTH_TIMEOUT))
+            if CHECK_ETCD:
+                print("%s  (elapsed %ds / %ds)" % (etcd_line, elapsed, HEALTH_TIMEOUT))
 
             if not failures:
                 summarise(True, [], node_line, pod_line,
-                          int(time.time() - started), attempts)
+                          int(time.time() - started), attempts, etcd_line)
                 return 0
 
             for failure in failures:
@@ -493,7 +581,7 @@ def main():
             print("ERROR: assertions still failing after %ds." % HEALTH_TIMEOUT)
             dump_diagnostics(unhealthy_refs)
             summarise(False, failures, node_line, pod_line,
-                      int(time.time() - started), attempts)
+                      int(time.time() - started), attempts, etcd_line)
             return 1
 
         remaining = int(deadline - time.time())

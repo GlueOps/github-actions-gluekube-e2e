@@ -96,6 +96,14 @@ inputs:
     description: "Seconds between smoke attempts"
     required: false
     default: "10"
+  check-etcd:
+    description: >-
+      Set to "1" to assert that every control-plane node's etcd metrics endpoint,
+      http://<node InternalIP>:2381/metrics, answers HTTP 200. Requires etcd's
+      --listen-metrics-urls to include the node IP (kubeadm's default binds it to
+      127.0.0.1 only). On by default.
+    required: true
+    default: ""
 
 runs:
   using: composite
@@ -123,6 +131,8 @@ runs:
         EXPECTED_KUBELET_VERSION: ${{ inputs.expected-kubelet-version }}
         REQUIRE_SCHEDULABLE: ${{ inputs.require-schedulable }}
         SMOKE_TEST: ${{ inputs.smoke-test }}
+        # No `||` fallback: empty means "assertion off".
+        CHECK_ETCD: ${{ inputs.check-etcd }}
         SMOKE_TIMEOUT: ${{ inputs.smoke-timeout || '300' }}
         SMOKE_POLL_INTERVAL: ${{ inputs.smoke-poll-interval || '10' }}
       run: bash "${{ github.action_path }}/check_cluster_health.sh"

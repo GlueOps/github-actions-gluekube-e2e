@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.2](https://github.com/GlueOps/github-actions-gluekube-e2e/compare/v1.1.1...v1.1.2) (2026-11-02)
+
+
+### Miscellaneous Chores
+
+* drop config:recommended from renovate.json ([#13](https://github.com/GlueOps/github-actions-gluekube-e2e/issues/13)) ([81a8a4c](https://github.com/GlueOps/github-actions-gluekube-e2e/commit/81a8a4cda1f96cc49b63763f5afba6e12d249704))
+* update docs to mention autoglue creds and their mapping ([#10](https://github.com/GlueOps/github-actions-gluekube-e2e/issues/10)) ([e49573f](https://github.com/GlueOps/github-actions-gluekube-e2e/commit/e49573ff980da1ce332dab0fa318a1abf2211cda))
+
 ## [1.1.1](https://github.com/GlueOps/github-actions-gluekube-e2e/compare/v1.1.0...v1.1.1) (2026-09-16)
 
 

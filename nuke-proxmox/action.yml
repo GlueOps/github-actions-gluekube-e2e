@@ -1,7 +1,7 @@
 name: "GlueKube: nuke Proxmox cluster resources"
 description: >-
   Backstop cleanup for a failed tofu destroy: force-delete every VM tagged with
-  the cluster name and any leftover cloud-init snippets.
+  the cluster name and any leftover cloud-init snippets and seed ISOs.
 
 inputs:
   cluster-name:

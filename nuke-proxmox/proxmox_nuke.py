@@ -3,19 +3,21 @@
 proxmox-nuke — Delete all Proxmox resources belonging to a GlueKube cluster.
 
 Backstop cleanup for when `tofu destroy` fails partway and orphans Proxmox VMs
-and cloud-init snippet files with no way to remove them from state. It talks to
+and cloud-init files with no way to remove them from state. It talks to
 the Proxmox VE API directly and deletes, for a single cluster:
 
   - every QEMU VM tagged with the cluster name (stopping it first if running);
     deleting a VM also removes any firewall rules attached to it, and
-  - every cloud-init snippet file named "<cluster>-*" in the `local` datastore.
+  - every cloud-init snippet ("<cluster>-*-cloud-init.yaml") and seed ISO
+    ("<cluster>-*-cloud-init.iso") in the `local` datastore of each node (a
+    failed `proxmox_cloudinit_bootstrap` leaves its seed ISO behind).
 
 Resources are matched by the cluster name that the module stamps on them:
-VMs carry it as their first tag (e.g. tags = [cluster, "bastion"]) and snippet
-filenames are prefixed "<cluster>-". Nothing else is touched — an empty cluster
+VMs carry it as their first tag (e.g. tags = [cluster, "bastion"]) and file
+names are "<cluster>-...-cloud-init.yaml" or "<cluster>-...-cloud-init.iso". Nothing else is touched — an empty cluster
 name is refused so the filter can never match everything.
 
-Credentials are never deleted; only VMs and snippet files are removed.
+Credentials are never deleted; only VMs, snippets and seed ISOs are removed.
 
 Usage:
   # via environment variables
@@ -143,17 +145,17 @@ class ProxmoxClient:
         )
         resp.raise_for_status()
 
-    # -- nodes & snippet files --
+    # -- nodes & cloud-init files --
 
     def list_nodes(self) -> list[dict]:
         resp = self._get("/nodes")
         resp.raise_for_status()
         return resp.json()["data"]
 
-    def list_snippets(self, node: str) -> list[dict]:
+    def list_content(self, node: str, content: str) -> list[dict]:
         resp = self._get(
             f"/nodes/{node}/storage/local/content",
-            params={"content": "snippets"},
+            params={"content": content},
         )
         resp.raise_for_status()
         return resp.json()["data"]
@@ -203,14 +205,19 @@ def parse_provider_credentials(raw: str) -> dict[str, str]:
     return out
 
 
-def _snippet_matches(volid: str, cluster: str) -> bool:
-    """True if the snippet's filename starts with "<cluster>-".
+CLOUD_INIT_SUFFIXES = ("-cloud-init.yaml", "-cloud-init.iso")
 
-    volid looks like "local:snippets/<cluster>-bastion-cloud-init.yaml". The
-    trailing hyphen keeps cluster "dev" from matching "dev2-..." filenames.
+
+def _file_matches(volid: str, cluster: str) -> bool:
+    """True if the file is one of the cluster's cloud-init files.
+
+    volid looks like "local:snippets/<cluster>-bastion-cloud-init.yaml" or
+    "local:iso/<cluster>-bastion-cloud-init.iso". The trailing hyphen keeps
+    cluster "dev" from matching "dev2-..."; the suffix keeps it off other files
+    that merely start with the cluster name.
     """
     filename = volid.split("/", 1)[-1]
-    return filename.startswith(f"{cluster}-")
+    return filename.startswith(f"{cluster}-") and filename.endswith(CLOUD_INIT_SUFFIXES)
 
 
 # ---------------------------------------------------------------------------
@@ -249,24 +256,24 @@ def _delete_vms(client: ProxmoxClient, vms: list[dict], *, dry_run: bool) -> int
     return pending
 
 
-def _delete_snippets(
+def _delete_files(
     client: ProxmoxClient,
-    snippets: list[tuple[str, str]],
+    files: list[tuple[str, str]],
     *,
     dry_run: bool,
 ) -> int:
-    """Delete matched snippet files. `snippets` is a list of (node, volid)."""
+    """Delete matched files. `files` is a list of (node, volid)."""
     failures = 0
-    for node, volid in snippets:
+    for node, volid in files:
         display = f"{volid} on {node}"
         if dry_run:
-            log.info("  [dry-run] Would delete snippet %s", display)
+            log.info("  [dry-run] Would delete %s", display)
             continue
         try:
             client.delete_content(node, volid)
-            log.info("  Deleted snippet %s", display)
+            log.info("  Deleted %s", display)
         except Exception as exc:
-            log.warning("  Failed to delete snippet %s: %s", display, exc)
+            log.warning("  Failed to delete %s: %s", display, exc)
             failures += 1
     return failures
 
@@ -289,35 +296,40 @@ def nuke(
         # 1. List and filter VMs by tag.
         vms = [vm for vm in client.list_vms() if _vm_matches(vm, cluster)]
 
-        # 2. List and filter snippets by filename prefix, per node.
-        snippets: list[tuple[str, str]] = []
+        # 2. List and filter snippets and seed ISOs by file name prefix, per node.
+        files: list[tuple[str, str]] = []
+        list_errors = 0
         for node in client.list_nodes():
             node_name = node["node"]
-            try:
-                for item in client.list_snippets(node_name):
-                    volid = item["volid"]
-                    if _snippet_matches(volid, cluster):
-                        snippets.append((node_name, volid))
-            except Exception as exc:
-                log.warning("  Failed to list snippets on node %s: %s", node_name, exc)
+            for content in ("snippets", "iso"):
+                try:
+                    for item in client.list_content(node_name, content):
+                        volid = item["volid"]
+                        if _file_matches(volid, cluster):
+                            files.append((node_name, volid))
+                except Exception as exc:
+                    log.warning("  Failed to list %s on node %s: %s", content, node_name, exc)
+                    list_errors += 1
 
-        total = len(vms) + len(snippets)
-        log.info("  Resources: vms=%d  snippets=%d  (total=%d)", len(vms), len(snippets), total)
+        total = len(vms) + len(files)
+        log.info("  Resources: vms=%d  files=%d  (total=%d)", len(vms), len(files), total)
 
-        if total == 0:
+        # A listing that failed may have hidden files, so it can't count as clean.
+        if total == 0 and list_errors == 0:
             log.info("Cluster %s is clean — nothing to nuke.", cluster)
             return True
 
         if dry_run:
             log.info("  [dry-run] Listing resources that would be deleted:")
             _delete_vms(client, vms, dry_run=True)
-            _delete_snippets(client, snippets, dry_run=True)
+            _delete_files(client, files, dry_run=True)
             log.info("Dry run complete — no resources were modified.")
             return True
 
-        # 3. Delete VMs (removes their firewall rules too), then snippets.
+        # 3. Delete VMs (removes their firewall rules too), then files.
         failures = _delete_vms(client, vms, dry_run=False)
-        failures += _delete_snippets(client, snippets, dry_run=False)
+        failures += _delete_files(client, files, dry_run=False)
+        failures += list_errors
 
         if failures == 0:
             log.info("All resources deleted in round %d.", round_num)
